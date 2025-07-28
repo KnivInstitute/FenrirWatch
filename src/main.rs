@@ -1,11 +1,103 @@
 mod core;
+mod gui;
+mod config;
 
-use core::ProcessMonitor;
+use core::{ProcessMonitor, RegistryMonitor, ServiceMonitor, DriverMonitor, AutostartMonitor, HookDetector};
+use core::Event;
+use core::EventLogger;
+use config::Config;
+use crossbeam_channel::unbounded;
 
 fn main() {
     println!("FenrirWatch starting up...");
-    let monitor = ProcessMonitor;
-    if let Err(e) = monitor.start() {
-        eprintln!("Error starting process monitor: {}", e);
+    // Always load from src/config/config.yaml using our local config module
+    let config = match Config::load_yaml_config("src/config/config.yaml") {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            eprintln!("[Config] Failed to load src/config/config.yaml: {}. Using defaults.", e);
+            Config {
+                log_path: "fenrirwatch.log".to_string(),
+                log_format: "json".to_string(),
+            }
+        }
+    };
+    
+    // Create channels for events
+    let (sender, receiver) = unbounded::<core::Event>();
+    let (log_sender, log_receiver) = unbounded::<core::Event>();
+    let (gui_sender, gui_receiver) = unbounded::<core::Event>();
+    
+    // Fan out events to both logger and GUI
+    {
+        let log_sender = log_sender.clone();
+        let gui_sender = gui_sender.clone();
+        std::thread::spawn(move || {
+            for event in receiver.iter() {
+                let _ = log_sender.send(event.clone());
+                let _ = gui_sender.send(event);
+            }
+        });
     }
+    
+    // Start all monitors in background threads
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let monitor = ProcessMonitor;
+            if let Err(e) = monitor.start_with_sender(sender) {
+                eprintln!("Error in ProcessMonitor: {}", e);
+            }
+        });
+    }
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut monitor = RegistryMonitor::new();
+            if let Err(e) = monitor.start_with_sender(sender) {
+                eprintln!("Error in RegistryMonitor: {}", e);
+            }
+        });
+    }
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let monitor = ServiceMonitor;
+            if let Err(e) = monitor.start_with_sender(sender) {
+                eprintln!("Error in ServiceMonitor: {}", e);
+            }
+        });
+    }
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let mut monitor = DriverMonitor::new();
+            if let Err(e) = monitor.start_with_sender(sender) {
+                eprintln!("Error in DriverMonitor: {}", e);
+            }
+        });
+    }
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let monitor = AutostartMonitor;
+            if let Err(e) = monitor.start_with_sender(sender) {
+                eprintln!("Error in AutostartMonitor: {}", e);
+            }
+        });
+    }
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let monitor = HookDetector;
+            if let Err(e) = monitor.start_with_sender(sender) {
+                eprintln!("Error in HookDetector: {}", e);
+            }
+        });
+    }
+    
+    // Start logger
+    EventLogger::start_logging(log_receiver, &config.log_path);
+    
+    // Launch the GUI (main thread)
+    gui::launch_gui(gui_receiver);
 }

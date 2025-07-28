@@ -1,0 +1,2 @@
+log_path: fenrirwatch.log
+log_format: json 
