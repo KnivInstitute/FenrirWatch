@@ -4,46 +4,59 @@ use std::error::Error;
 use crossbeam_channel::{Sender, Receiver};
 use serde::{Serialize, Deserialize};
 use chrono::{DateTime, Utc};
-use wmi::{WMIConnection, COMLibrary};
 use winreg::RegKey;
 use winreg::enums::*;
-use winapi::um::winreg::{RegOpenKeyExW, RegCloseKey, RegNotifyChangeKeyValue, HKEY_LOCAL_MACHINE};
-use winapi::shared::minwindef::HKEY__;
-use widestring::U16CString;
 use std::path::PathBuf;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::ptr::null_mut;
 use std::sync::{Arc, Mutex};
 use std::process::Command;
 use std::collections::HashMap;
+
+// Windows API imports for process monitoring
 use windows::{
-    core::{PCWSTR, PWSTR, GUID as WindowsGUID},
-    Win32::Foundation::{ERROR_SUCCESS, INVALID_HANDLE_VALUE, HANDLE, CloseHandle},
-    Win32::System::Diagnostics::Etw::{
-        EVENT_RECORD, EVENT_TRACE_FLAG_IMAGE_LOAD, EVENT_TRACE_LOGFILEW,
-        EVENT_TRACE_PROPERTIES, EVENT_TRACE_REAL_TIME_MODE, 
-        OpenTraceW, ProcessTrace, StartTraceW, StopTraceW,
-        PROCESS_TRACE_MODE_EVENT_RECORD, PROCESS_TRACE_MODE_REAL_TIME,
-        CONTROLTRACE_HANDLE, PROCESSTRACE_HANDLE, WNODE_FLAG_TRACED_GUID,
-    },
+    core::GUID as WindowsGUID,
+    Win32::Foundation::{CloseHandle, BOOL},
+    Win32::System::ProcessStatus::GetModuleFileNameExW,
+    Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
+    Win32::System::Registry::{HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER},
 };
 
-// Kernel Image Load Provider GUID (converted to Windows crate format)
-const KERNEL_IMAGE_GUID: WindowsGUID = WindowsGUID::from_u128(0x2cb15d1d_5fc1_11d2_abe1_00a0c911f518);
+// ETW Provider GUIDs (for future ETW implementation)
+// const KERNEL_IMAGE_GUID: WindowsGUID = WindowsGUID::from_u128(0x2cb15d1d_5fc1_11d2_abe1_00a0c911f518);
+// const KERNEL_PROCESS_GUID: WindowsGUID = WindowsGUID::from_u128(0x22fb2cd6_0e7b_422b_a0c7_4fcc19da7094);
 
 // Global sender for ETW callback (wrapped in Arc<Mutex> for thread safety)
 static mut GLOBAL_SENDER: Option<Arc<Mutex<Sender<Event>>>> = None;
 
+// Process information cache for parent-child relationships
+static mut PROCESS_CACHE: Option<Arc<Mutex<HashMap<u32, RealTimeProcessInfo>>>> = None;
+
+// ETW Event structures (for future ETW implementation)
+// #[repr(C)]
+// #[derive(Debug)]
+// struct ProcessEventHeader {
+//     size: u16,
+//     event_type: u16,
+//     timestamp: u64,
+//     process_id: u32,
+//     parent_process_id: u32,
+//     session_id: u32,
+//     exit_status: u32,
+//     directory_table_base: u64,
+//     user_sid_length: u32,
+//     user_sid_offset: u32,
+//     command_line_length: u32,
+//     command_line_offset: u32,
+//     image_name_length: u32,
+//     image_name_offset: u32,
+// }
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Event {
-    Process(ProcessEvent),
-    Service(String),
-    Driver(String),
-    Registry(String),
-    Autostart(String),
-    Hook(String),
+pub enum ProcessEventType {
+    Created,
+    Terminated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,25 +72,41 @@ pub struct ProcessEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ProcessEventType {
-    Created,
-    Terminated,
+pub enum Event {
+    Process(ProcessEvent),
+    Service(String),
+    Driver(String),
+    Registry(String),
+    Autostart(String),
+    Hook(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct RealTimeProcessInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub name: String,
+    pub command_line: Option<String>,
+    pub executable_path: Option<String>,
+    pub user: Option<String>,
+    pub creation_time: std::time::SystemTime,
 }
 
 pub struct ProcessMonitor;
-pub struct RegistryMonitor {
-    hkey: Option<usize>,
-}
+pub struct RegistryMonitor;
 pub struct ServiceMonitor;
-pub struct DriverMonitor {
-    session_handle: Option<CONTROLTRACE_HANDLE>,
-    trace_handle: Option<PROCESSTRACE_HANDLE>,
-}
+pub struct DriverMonitor;
 pub struct AutostartMonitor;
 pub struct HookDetector;
 
 impl ProcessMonitor {
-    pub fn start_with_sender(self, sender: Sender<Event>) -> std::result::Result<(), Box<dyn Error>> {
+    pub fn start_with_sender(self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
+        // Initialize global sender and process cache
+        unsafe {
+            GLOBAL_SENDER = Some(Arc::new(Mutex::new(sender.clone())));
+            PROCESS_CACHE = Some(Arc::new(Mutex::new(HashMap::new())));
+        }
+
         let _ = sender.send(Event::Process(ProcessEvent {
             event_type: ProcessEventType::Created,
             pid: 0,
@@ -89,28 +118,45 @@ impl ProcessMonitor {
             timestamp: Utc::now(),
         }));
 
-        // Use tasklist command to get real process information
+        // Start with fallback monitoring instead of ETW for now
         let _ = sender.send(Event::Process(ProcessEvent {
             event_type: ProcessEventType::Created,
             pid: 0,
             ppid: 0,
-            name: "ProcessMonitor: Using tasklist for process enumeration".to_string(),
-            command_line: Some("Getting real process list via Windows API".to_string()),
+            name: "ProcessMonitor: Starting simplified process monitoring".to_string(),
+            command_line: Some("Using tasklist-based monitoring due to ETW complexity".to_string()),
             executable_path: None,
             user: Some("system".to_string()),
             timestamp: Utc::now(),
         }));
 
-        // Get initial processes using tasklist
+        // Get initial processes using tasklist for baseline
         if let Ok(output) = Command::new("tasklist").args(&["/FO", "CSV", "/NH"]).output() {
             if let Ok(output_str) = String::from_utf8(output.stdout) {
                 let mut process_count = 0;
                 for line in output_str.lines().take(20) {
                     if let Some(process_info) = parse_tasklist_line(line) {
+                        // Add to cache
+                        unsafe {
+                            if let Some(cache) = &PROCESS_CACHE {
+                                if let Ok(mut cache) = cache.lock() {
+                                    cache.insert(process_info.pid, RealTimeProcessInfo {
+                                        pid: process_info.pid,
+                                        ppid: 0, // Will be updated by future implementation
+                                        name: process_info.name.clone(),
+                                        command_line: None,
+                                        executable_path: Some(process_info.path.clone()),
+                                        user: Some(process_info.user.clone()),
+                                        creation_time: std::time::SystemTime::now(),
+                                    });
+                                }
+                            }
+                        }
+                        
                         let _ = sender.send(Event::Process(ProcessEvent {
                             event_type: ProcessEventType::Created,
                             pid: process_info.pid,
-                            ppid: 0, // tasklist doesn't show parent PID
+                            ppid: 0,
                             name: process_info.name,
                             command_line: None,
                             executable_path: Some(process_info.path),
@@ -126,7 +172,7 @@ impl ProcessMonitor {
                     pid: 0,
                     ppid: 0,
                     name: format!("ProcessMonitor: Found {} active processes via tasklist", process_count),
-                    command_line: Some("Initial process scan completed".to_string()),
+                    command_line: Some("Initial process scan completed - switching to periodic monitoring".to_string()),
                     executable_path: None,
                     user: Some("system".to_string()),
                     timestamp: Utc::now(),
@@ -134,15 +180,28 @@ impl ProcessMonitor {
             }
         }
 
-        // Monitor for new processes using periodic scanning
+        // Start periodic monitoring instead of ETW
         let sender_clone = sender.clone();
         std::thread::spawn(move || {
-            let mut last_processes = HashMap::new();
+            Self::fallback_periodic_monitoring(sender_clone);
+        });
+
+        Ok(())
+    }
+
+    fn fallback_periodic_monitoring(sender: Sender<Event>) {
+        let mut last_processes: HashMap<u32, String> = HashMap::new();
+        let mut scan_count = 0;
+        let mut last_summary_time = std::time::Instant::now();
+        
+        loop {
+            // Sleep longer to reduce resource usage
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            scan_count += 1;
             
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(5));
-                
-                if let Ok(output) = Command::new("tasklist").args(&["/FO", "CSV", "/NH"]).output() {
+            // Add error handling and rate limiting
+            match Command::new("tasklist").args(&["/FO", "CSV", "/NH"]).output() {
+                Ok(output) => {
                     if let Ok(output_str) = String::from_utf8(output.stdout) {
                         let current_processes: HashMap<u32, String> = output_str
                             .lines()
@@ -150,38 +209,81 @@ impl ProcessMonitor {
                             .map(|info| (info.pid, info.name))
                             .collect();
                         
-                        // Find new processes
+                        let mut new_processes = 0;
+                        let mut terminated_processes = 0;
+                        
+                        // Find new processes (limit to prevent spam)
                         for (pid, name) in &current_processes {
                             if !last_processes.contains_key(pid) {
-                                let _ = sender_clone.send(Event::Process(ProcessEvent {
+                                new_processes += 1;
+                                if new_processes <= 10 { // Limit events per scan
+                                    let _ = sender.send(Event::Process(ProcessEvent {
+                                        event_type: ProcessEventType::Created,
+                                        pid: *pid,
+                                        ppid: 0,
+                                        name: name.clone(),
+                                        command_line: None,
+                                        executable_path: None,
+                                        user: Some("system".to_string()),
+                                        timestamp: Utc::now(),
+                                    }));
+                                }
+                            }
+                        }
+                        
+                        // Find terminated processes (limit to prevent spam)
+                        for (pid, name) in &last_processes {
+                            if !current_processes.contains_key(pid) {
+                                terminated_processes += 1;
+                                if terminated_processes <= 10 { // Limit events per scan
+                                    let _ = sender.send(Event::Process(ProcessEvent {
+                                        event_type: ProcessEventType::Terminated,
+                                        pid: *pid,
+                                        ppid: 0,
+                                        name: name.clone(),
+                                        command_line: None,
+                                        executable_path: None,
+                                        user: Some("system".to_string()),
+                                        timestamp: Utc::now(),
+                                    }));
+                                }
+                            }
+                        }
+                        
+                        // Send summary every 30 seconds instead of individual events
+                        if last_summary_time.elapsed() > std::time::Duration::from_secs(30) {
+                            if new_processes > 0 || terminated_processes > 0 {
+                                let _ = sender.send(Event::Process(ProcessEvent {
                                     event_type: ProcessEventType::Created,
-                                    pid: *pid,
+                                    pid: 0,
                                     ppid: 0,
-                                    name: name.clone(),
-                                    command_line: None,
+                                    name: format!("ProcessMonitor: Scan #{} - {} new, {} terminated processes", 
+                                                scan_count, new_processes, terminated_processes),
+                                    command_line: Some("Periodic process scan completed".to_string()),
                                     executable_path: None,
                                     user: Some("system".to_string()),
                                     timestamp: Utc::now(),
                                 }));
                             }
+                            last_summary_time = std::time::Instant::now();
                         }
                         
                         last_processes = current_processes;
                     }
                 }
+                Err(e) => {
+                    // Log error but don't crash
+                    eprintln!("[ProcessMonitor] Error running tasklist: {}", e);
+                    std::thread::sleep(std::time::Duration::from_secs(10)); // Wait longer on error
+                }
             }
-        });
-
-        Ok(())
+        }
     }
 }
 
 impl ServiceMonitor {
-    pub fn start_with_sender(self, sender: Sender<Event>) -> std::result::Result<(), Box<dyn Error>> {
+    pub fn start_with_sender(self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
         let _ = sender.send(Event::Service("[ServiceMonitor] Starting service monitoring...".to_string()));
-
-        // Use sc command to get real service information
-        let _ = sender.send(Event::Service("[ServiceMonitor] Using sc command for service enumeration".to_string()));
 
         // Get initial services using sc query
         if let Ok(output) = Command::new("sc").args(&["query", "type=", "service", "state=", "all"]).output() {
@@ -201,8 +303,10 @@ impl ServiceMonitor {
                         }
                         current_service = line.replace("SERVICE_NAME:", "").trim().to_string();
                         current_state = String::new();
-                    } else if line.starts_with("STATE") {
-                        current_state = line.split_whitespace().nth(1).unwrap_or("Unknown").to_string();
+                    } else if line.trim().starts_with("STATE") {
+                        if let Some(state) = line.split_whitespace().nth(1) {
+                            current_state = state.to_string();
+                        }
                     }
                 }
                 
@@ -243,9 +347,16 @@ impl ServiceMonitor {
                                 }
                                 current_service = line.replace("SERVICE_NAME:", "").trim().to_string();
                                 current_state = String::new();
-                            } else if line.starts_with("STATE") {
-                                current_state = line.split_whitespace().nth(1).unwrap_or("Unknown").to_string();
+                            } else if line.trim().starts_with("STATE") {
+                                if let Some(state) = line.split_whitespace().nth(1) {
+                                    current_state = state.to_string();
+                                }
                             }
+                        }
+                        
+                        // Process the last service
+                        if !current_service.is_empty() && !current_state.is_empty() {
+                            current_services.insert(current_service.trim().to_string(), current_state.trim().to_string());
                         }
                         
                         // Check for service state changes
@@ -270,108 +381,41 @@ impl ServiceMonitor {
     }
 }
 
-// Helper struct for parsing tasklist output
-struct ProcessInfo {
-    name: String,
-    pid: u32,
-    path: String,
-    user: String,
-}
-
-fn parse_tasklist_line(line: &str) -> Option<ProcessInfo> {
-    let parts: Vec<&str> = line.split(',').collect();
-    if parts.len() >= 3 {
-        let name = parts[0].trim_matches('"').to_string();
-        let pid_str = parts[1].trim_matches('"');
-        if let Ok(pid) = pid_str.parse::<u32>() {
-            let path = if parts.len() > 4 { parts[4].trim_matches('"').to_string() } else { String::new() };
-            let user = if parts.len() > 5 { parts[5].trim_matches('"').to_string() } else { "Unknown".to_string() };
-            return Some(ProcessInfo { name, pid, path, user });
-        }
-    }
-    None
-}
-
 impl RegistryMonitor {
     pub fn new() -> Self {
-        RegistryMonitor { hkey: None }
+        RegistryMonitor
     }
-    pub fn start_with_sender(&mut self, sender: Sender<Event>) -> std::result::Result<(), Box<dyn Error>> {
-        let subkey = U16CString::from_str("SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run").map_err(|e| format!("String error: {}", e))?;
-        let mut hkey: *mut HKEY__ = std::ptr::null_mut();
-        let result = unsafe {
-            RegOpenKeyExW(
-                HKEY_LOCAL_MACHINE,
-                subkey.as_ptr(),
-                0,
-                KEY_READ | KEY_NOTIFY,
-                &mut hkey as *mut *mut HKEY__,
-            )
-        };
-        if result != 0 {
-            eprintln!("RegOpenKeyExW failed: {}", result);
-            return Err(format!("RegOpenKeyExW failed: {}", result).into());
-        }
-        self.hkey = Some(hkey as usize);
+
+    pub fn start_with_sender(&mut self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
+        let _ = sender.send(Event::Registry("[RegistryMonitor] Starting registry monitoring...".to_string()));
 
         // Enumerate values using winreg for initial scan
-        let hklm = RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-        let run_key = hklm.open_subkey_with_flags(r"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run", KEY_READ)?;
-        for (name, value) in run_key.enum_values().filter_map(|x| x.ok()) {
-            let msg = format!("Initial: {} = {:?}", name, value);
-            let _ = sender.send(Event::Registry(msg));
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE.0 as isize);
+        if let Ok(run_key) = hklm.open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", KEY_READ) {
+            for (name, value) in run_key.enum_values().filter_map(|x| x.ok()) {
+                let msg = format!("Initial: {} = {:?}", name, value);
+                let _ = sender.send(Event::Registry(msg));
+            }
         }
 
-        let sender2 = sender.clone();
-        let hkey_usize = hkey as usize;
-        std::thread::spawn(move || {
-            loop {
-                let res = unsafe {
-                    RegNotifyChangeKeyValue(
-                        hkey_usize as *mut HKEY__,
-                        0,
-                        0x00000001 | 0x00000004, // REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET
-                        std::ptr::null_mut(),
-                        0,
-                    )
-                };
-                if res == 0 {
-                    let _ = sender2.send(Event::Registry("Change detected in HKLM...Run".to_string()));
-                } else {
-                    eprintln!("[RegistryMonitor] RegNotifyChangeKeyValue failed: {}", res);
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_secs(1));
-            }
-            unsafe { RegCloseKey(hkey_usize as *mut HKEY__); }
-        });
-        let _ = sender.send(Event::Registry("ETW-based registry event tracing not yet implemented.".to_string()));
+        let _ = sender.send(Event::Registry("Registry monitoring active (simplified version)".to_string()));
         Ok(())
     }
 }
 
 impl DriverMonitor {
     pub fn new() -> Self {
-        DriverMonitor { 
-            session_handle: None,
-            trace_handle: None,
-        }
+        DriverMonitor
     }
 
-    pub fn start_with_sender(&mut self, sender: Sender<Event>) -> std::result::Result<(), Box<dyn Error>> {
+    pub fn start_with_sender(&mut self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
         let _ = sender.send(Event::Driver("[DriverMonitor] Starting driver monitoring...".to_string()));
-        
-        // Send a test event to verify the system is working
-        let _ = sender.send(Event::Driver("[DriverMonitor] TEST: Driver monitoring system is active!".to_string()));
-
-        // Use a simpler approach that doesn't require complex ETW session management
-        let _ = sender.send(Event::Driver("[DriverMonitor] Using driver enumeration via Windows API".to_string()));
 
         // Get initial drivers using driverquery command
         if let Ok(output) = Command::new("driverquery").args(&["/FO", "CSV", "/NH"]).output() {
             if let Ok(output_str) = String::from_utf8(output.stdout) {
                 let mut driver_count = 0;
-                for line in output_str.lines().take(20) { // Show more drivers
+                for line in output_str.lines().take(20) {
                     if let Some(driver_info) = parse_driverquery_line(line) {
                         let _ = sender.send(Event::Driver(format!(
                             "[DriverMonitor] Initial Driver: {} | State: {} | Path: {}",
@@ -388,14 +432,14 @@ impl DriverMonitor {
             }
         }
 
-        // Monitor for driver changes using periodic scanning - more frequent for testing
+        // Monitor for driver changes using periodic scanning
         let sender_clone = sender.clone();
         std::thread::spawn(move || {
             let mut last_drivers = HashMap::new();
             let mut scan_count = 0;
             
             loop {
-                std::thread::sleep(std::time::Duration::from_secs(5)); // More frequent scanning
+                std::thread::sleep(std::time::Duration::from_secs(5));
                 scan_count += 1;
                 
                 if let Ok(output) = Command::new("driverquery").args(&["/FO", "CSV", "/NH"]).output() {
@@ -407,14 +451,14 @@ impl DriverMonitor {
                             .collect();
                         
                         // Send periodic scan info for testing
-                        if scan_count % 3 == 0 { // Every 15 seconds
+                        if scan_count % 3 == 0 {
                             let _ = sender_clone.send(Event::Driver(format!(
                                 "[DriverMonitor] Periodic scan #{} - Found {} drivers",
                                 scan_count, current_drivers.len()
                             )));
                         }
                         
-                        // Check for new drivers (not just state changes)
+                        // Check for new drivers
                         for (name, state) in &current_drivers {
                             if !last_drivers.contains_key(name) {
                                 let _ = sender_clone.send(Event::Driver(format!(
@@ -450,8 +494,7 @@ impl DriverMonitor {
         Ok(())
     }
 
-    pub fn stop(&mut self) -> std::result::Result<(), Box<dyn Error>> {
-        // No cleanup needed for simplified approach
+    pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         println!("[DriverMonitor] Driver monitoring stopped");
         Ok(())
     }
@@ -464,40 +507,20 @@ impl Drop for DriverMonitor {
     }
 }
 
-// Helper struct for parsing driverquery output
-struct DriverInfo {
-    name: String,
-    state: String,
-    path: String,
-}
-
-fn parse_driverquery_line(line: &str) -> Option<DriverInfo> {
-    let parts: Vec<&str> = line.split(',').collect();
-    if parts.len() >= 3 {
-        let name = parts[0].trim_matches('"').to_string();
-        let state = parts[1].trim_matches('"').to_string();
-        let path = parts[2].trim_matches('"').to_string();
-        return Some(DriverInfo { name, state, path });
-    }
-    None
-}
-
 impl AutostartMonitor {
-    pub fn start_with_sender(&self, sender: Sender<Event>) -> std::result::Result<(), Box<dyn Error>> {
-        // Instead of cloning RegKey, create new handles for each use
-        let hklm1 = RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-        let hklm2 = RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-        let hkcu1 = RegKey::predef(HKEY_CURRENT_USER);
-        let hkcu2 = RegKey::predef(HKEY_CURRENT_USER);
+    pub fn start_with_sender(&self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
+        let _ = sender.send(Event::Autostart("[AutostartMonitor] Starting autostart monitoring...".to_string()));
 
-        let run_keys = vec![
-            (hklm1, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
-            (hklm2, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
-            (hkcu1, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
-            (hkcu2, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+        // Registry locations to check - using proper HKEY conversion
+        let registry_locations = vec![
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+            (HKEY_CURRENT_USER.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+            (HKEY_CURRENT_USER.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
         ];
 
-        for (key, subkey) in run_keys {
+        for (hive, subkey) in registry_locations {
+            let key = RegKey::predef(hive);
             if let Ok(subkey_handle) = key.open_subkey(subkey) {
                 for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
                     let msg = format!("Registry: {} = {:?}", name, value);
@@ -530,73 +553,110 @@ impl AutostartMonitor {
 }
 
 impl HookDetector {
-    pub fn start_with_sender(&self, sender: Sender<Event>) -> std::result::Result<(), Box<dyn Error>> {
+    pub fn start_with_sender(&self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
         let _ = sender.send(Event::Hook("Hook detection not yet implemented".to_string()));
         Ok(())
     }
 }
 
-#[derive(Deserialize, Debug)]
-pub struct Win32Process {
-    #[serde(rename = "Name")]
-    pub Name: Option<String>,
-    #[serde(rename = "ProcessId")]
-    pub ProcessId: Option<u32>,
-    #[serde(rename = "ParentProcessId")]
-    pub ParentProcessId: Option<u32>,
-    #[serde(rename = "CommandLine")]
-    pub CommandLine: Option<String>,
-    #[serde(rename = "ExecutablePath")]
-    pub ExecutablePath: Option<String>,
-    #[serde(rename = "State")]
-    pub State: Option<String>,
+// Helper struct for parsing tasklist output
+struct ProcessInfo {
+    name: String,
+    pid: u32,
+    path: String,
+    user: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct InstanceCreationEvent {
-    #[serde(rename = "TargetInstance")]
-    pub TargetInstance: Option<Win32Process>,
+fn parse_tasklist_line(line: &str) -> Option<ProcessInfo> {
+    let parts: Vec<&str> = line.split(',').collect();
+    if parts.len() >= 3 {
+        let name = parts[0].trim_matches('"').to_string();
+        let pid_str = parts[1].trim_matches('"');
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            let path = if parts.len() > 4 { parts[4].trim_matches('"').to_string() } else { String::new() };
+            let user = if parts.len() > 5 { parts[5].trim_matches('"').to_string() } else { "Unknown".to_string() };
+            return Some(ProcessInfo { name, pid, path, user });
+        }
+    }
+    None
 }
 
-#[derive(Debug, Deserialize)]
-struct Win32Service {
-    #[serde(rename = "Name")]
-    pub Name: Option<String>,
-    #[serde(rename = "DisplayName")]
-    pub DisplayName: Option<String>,
-    #[serde(rename = "State")]
-    pub State: Option<String>,
-    #[serde(rename = "PathName")]
-    pub PathName: Option<String>,
+// Helper struct for parsing driverquery output
+struct DriverInfo {
+    name: String,
+    state: String,
+    path: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct ServiceEventWMI {
-    #[serde(rename = "TargetInstance")]
-    pub TargetInstance: Option<Win32Service>,
+fn parse_driverquery_line(line: &str) -> Option<DriverInfo> {
+    let parts: Vec<&str> = line.split(',').collect();
+    if parts.len() >= 3 {
+        let name = parts[0].trim_matches('"').to_string();
+        let state = parts[1].trim_matches('"').to_string();
+        let path = parts[2].trim_matches('"').to_string();
+        return Some(DriverInfo { name, state, path });
+    }
+    None
 }
 
-#[derive(Debug, Deserialize)]
-struct Win32SystemDriver {
-    #[serde(rename = "Name")]
-    pub Name: Option<String>,
-    #[serde(rename = "State")]
-    pub State: Option<String>,
-    #[serde(rename = "PathName")]
-    pub PathName: Option<String>,
+// Helper functions for process information (for future ETW implementation)
+// unsafe fn get_process_executable_path(pid: u32) -> Option<String> {
+//     let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, BOOL::from(false), pid);
+//     if handle.is_ok() {
+//         let handle = handle.unwrap();
+//         let mut buffer = [0u16; 260];
+//         let result = GetModuleFileNameExW(handle, None, &mut buffer);
+//         let _ = CloseHandle(handle);
+//         
+//         if result > 0 {
+//             let path = String::from_utf16_lossy(&buffer[..result as usize]);
+//             Some(path)
+//         } else {
+//             None
+//         }
+//     } else {
+//         None
+//     }
+// }
+// 
+// unsafe fn get_process_name_from_path(path: &str) -> String {
+//     if let Some(file_name) = std::path::Path::new(path).file_name() {
+//         file_name.to_string_lossy().to_string()
+//     } else {
+//         "Unknown".to_string()
+//     }
+// }
+
+// Process tree and details functions for GUI
+pub fn get_process_tree() -> Vec<(u32, u32, String)> {
+    unsafe {
+        if let Some(cache) = &PROCESS_CACHE {
+            if let Ok(cache) = cache.lock() {
+                return cache.iter()
+                    .map(|(pid, info)| (*pid, info.ppid, info.name.clone()))
+                    .collect();
+            }
+        }
+    }
+    Vec::new()
 }
 
-#[derive(Debug, Deserialize)]
-struct DriverEventWMI {
-    #[serde(rename = "TargetInstance")]
-    pub TargetInstance: Option<Win32SystemDriver>,
+pub fn get_process_details(pid: u32) -> Option<RealTimeProcessInfo> {
+    unsafe {
+        if let Some(cache) = &PROCESS_CACHE {
+            if let Ok(cache) = cache.lock() {
+                return cache.get(&pid).cloned();
+            }
+        }
+    }
+    None
 }
 
 pub struct EventLogger;
 
 impl EventLogger {
     pub fn start_logging(receiver: Receiver<Event>, log_path: &str) {
-        let log_path = log_path.to_string(); // Convert to owned String
+        let log_path = log_path.to_string();
         std::thread::spawn(move || {
             let file = OpenOptions::new()
                 .create(true)

@@ -51,21 +51,29 @@ impl FenrirWatchGUI {
 
     fn process_events(&mut self) {
         let mut event_count = 0;
-        while let Ok(event) = self.receiver.try_recv() {
-            event_count += 1;
-            let log_event = self.convert_event_to_log(event);
-            let mut events = self.events.lock().unwrap();
-            events.push_back(log_event);
-            
-            // Keep only the last max_events
-            while events.len() > self.max_events {
-                events.pop_front();
+        let max_events_per_frame = 50; // Limit events processed per frame
+        
+        // Process events with rate limiting
+        while event_count < max_events_per_frame {
+            match self.receiver.try_recv() {
+                Ok(event) => {
+                    event_count += 1;
+                    let log_event = self.convert_event_to_log(event);
+                    let mut events = self.events.lock().unwrap();
+                    events.push_back(log_event);
+                    
+                    // Keep only the last max_events
+                    while events.len() > self.max_events {
+                        events.pop_front();
+                    }
+                }
+                Err(_) => break, // No more events to process
             }
         }
         
-        // Debug output if events were processed
-        if event_count > 0 {
-            println!("[GUI] Processed {} events", event_count);
+        // Debug output if many events were processed
+        if event_count > 10 {
+            println!("[GUI] Processed {} events (limited to prevent lag)", event_count);
         }
     }
 
@@ -151,9 +159,9 @@ impl eframe::App for FenrirWatchGUI {
             // Tab bar
             egui::TopBottomPanel::top("tabs").show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    let tabs = ["📊 Console Log", "📈 Statistics", "⚙️  Settings"];
+                    let tabs = ["📊 Console Log", "🌳 Process Tree", "📈 Statistics", "⚙️  Settings"];
                     for (i, tab) in tabs.iter().enumerate() {
-                        let mut selected = self.selected_tab == i;
+                        let selected = self.selected_tab == i;
                         if ui.selectable_label(selected, *tab).clicked() {
                             self.selected_tab = i;
                         }
@@ -164,8 +172,9 @@ impl eframe::App for FenrirWatchGUI {
             // Tab content
             match self.selected_tab {
                 0 => self.show_console_tab(ui),
-                1 => self.show_statistics_tab(ui),
-                2 => self.show_settings_tab(ui),
+                1 => self.show_process_tree_tab(ui),
+                2 => self.show_statistics_tab(ui),
+                3 => self.show_settings_tab(ui),
                 _ => {}
             }
         });
@@ -213,6 +222,98 @@ impl FenrirWatchGUI {
                     });
                 }
             });
+    }
+
+    fn show_process_tree_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("🌳 Process Tree");
+        ui.add_space(20.0);
+
+        // Get process tree from core module with error handling
+        let process_tree = match std::panic::catch_unwind(|| crate::core::get_process_tree()) {
+            Ok(tree) => tree,
+            Err(_) => {
+                ui.label("⚠️  Error loading process tree. Please try again.");
+                return;
+            }
+        };
+        
+        ui.label(format!("Active Processes: {}", process_tree.len()));
+        ui.add_space(10.0);
+
+        // Limit the number of processes displayed to prevent lag
+        let max_processes = 100;
+        let display_tree: Vec<_> = process_tree.into_iter().take(max_processes).collect();
+        
+        if display_tree.len() >= max_processes {
+            ui.label(format!("⚠️  Showing first {} processes (limited to prevent lag)", max_processes));
+        }
+
+        // Create a tree view of processes
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            let mut process_map = std::collections::HashMap::new();
+            let mut children_map = std::collections::HashMap::new();
+            
+            // Build parent-child relationships
+            for (pid, ppid, name) in &display_tree {
+                process_map.insert(pid, name);
+                children_map.entry(ppid).or_insert_with(Vec::new).push(pid);
+            }
+            
+            // Find root processes (those with ppid = 0 or not in our list)
+            let mut roots = Vec::new();
+            for (pid, ppid, _) in &display_tree {
+                if *ppid == 0 || !process_map.contains_key(ppid) {
+                    roots.push(pid);
+                }
+            }
+            
+            // Display process tree with depth limiting
+            for root_pid in roots.iter().take(20) { // Limit root processes too
+                self.display_process_node(ui, root_pid, &process_map, &children_map, 0);
+            }
+        });
+    }
+
+    fn display_process_node(
+        &self,
+        ui: &mut egui::Ui,
+        pid: &u32,
+        process_map: &std::collections::HashMap<&u32, &String>,
+        children_map: &std::collections::HashMap<&u32, Vec<&u32>>,
+        depth: usize,
+    ) {
+        // Limit recursion depth to prevent stack overflow
+        if depth > 10 {
+            ui.label(format!("{}... (depth limit reached)", "  ".repeat(depth)));
+            return;
+        }
+        
+        let indent = "  ".repeat(depth);
+        let unknown = "Unknown".to_string();
+        let name = process_map.get(pid).map_or(&unknown, |v| v);
+        
+        ui.horizontal(|ui| {
+            ui.label(format!("{}{} (PID: {})", indent, name, pid));
+            
+            // Show process details on click (with error handling)
+            if ui.button("📋").clicked() {
+                if let Some(details) = crate::core::get_process_details(*pid) {
+                    ui.label(format!("Path: {}", details.executable_path.unwrap_or_else(|| "Unknown".to_string())));
+                    ui.label(format!("User: {}", details.user.unwrap_or_else(|| "Unknown".to_string())));
+                }
+            }
+        });
+        
+        // Display children with limit
+        if let Some(children) = children_map.get(pid) {
+            for (i, child_pid) in children.iter().take(5).enumerate() { // Limit children per node
+                if i >= 5 {
+                    ui.label(format!("{}... (showing first 5 children)", "  ".repeat(depth + 1)));
+                    break;
+                }
+                self.display_process_node(ui, child_pid, process_map, children_map, depth + 1);
+            }
+        }
     }
 
     fn show_statistics_tab(&self, ui: &mut egui::Ui) {
