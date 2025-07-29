@@ -387,19 +387,117 @@ impl RegistryMonitor {
     }
 
     pub fn start_with_sender(&mut self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
-        let _ = sender.send(Event::Registry("[RegistryMonitor] Starting registry monitoring...".to_string()));
+        let _ = sender.send(Event::Registry("[RegistryMonitor] Starting real-time registry monitoring...".to_string()));
 
-        // Enumerate values using winreg for initial scan
-        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE.0 as isize);
-        if let Ok(run_key) = hklm.open_subkey_with_flags(r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run", KEY_READ) {
-            for (name, value) in run_key.enum_values().filter_map(|x| x.ok()) {
-                let msg = format!("Initial: {} = {:?}", name, value);
-                let _ = sender.send(Event::Registry(msg));
+        // Critical registry keys to monitor for security
+        let critical_keys = vec![
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"),
+            (HKEY_CURRENT_USER.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
+            (HKEY_CURRENT_USER.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellExecuteHooks"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SYSTEM\CurrentControlSet\Services"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"),
+        ];
+
+        // Initial scan of critical keys
+        for (hive, subkey) in &critical_keys {
+            let key = RegKey::predef(*hive);
+            if let Ok(subkey_handle) = key.open_subkey_with_flags(subkey, KEY_READ) {
+                let _ = sender.send(Event::Registry(format!(
+                    "[RegistryMonitor] Monitoring: {}",
+                    subkey
+                )));
+                
+                // Enumerate initial values
+                for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
+                    let msg = format!("Initial: {} = {:?}", name, value);
+                    let _ = sender.send(Event::Registry(msg));
+                }
             }
         }
 
-        let _ = sender.send(Event::Registry("Registry monitoring active (simplified version)".to_string()));
+        // Start enhanced periodic monitoring
+        let sender_clone = sender.clone();
+        std::thread::spawn(move || {
+            Self::enhanced_registry_monitoring(sender_clone, critical_keys);
+        });
+
         Ok(())
+    }
+
+    fn enhanced_registry_monitoring(sender: Sender<Event>, critical_keys: Vec<(isize, &'static str)>) {
+        let mut last_values: HashMap<String, String> = HashMap::new();
+        let mut scan_count = 0;
+        let mut last_summary_time = std::time::Instant::now();
+        
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3)); // More frequent scanning
+            scan_count += 1;
+            
+            let mut current_values: HashMap<String, String> = HashMap::new();
+            let mut changes_detected = 0;
+            
+            for (hive, subkey) in &critical_keys {
+                let key = RegKey::predef(*hive);
+                if let Ok(subkey_handle) = key.open_subkey_with_flags(subkey, KEY_READ) {
+                    let key_name = format!("{}\\{}", 
+                        if *hive == HKEY_LOCAL_MACHINE.0 as isize { "HKLM" } else { "HKCU" }, 
+                        subkey
+                    );
+                    
+                    for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
+                        let full_key = format!("{}\\{}", key_name, name);
+                        let value_str = format!("{:?}", value);
+                        current_values.insert(full_key.clone(), value_str.clone());
+                        
+                        // Check for new or changed values
+                        if let Some(old_value) = last_values.get(&full_key) {
+                            if old_value != &value_str {
+                                changes_detected += 1;
+                                let _ = sender.send(Event::Registry(format!(
+                                    "[RegistryMonitor] CHANGED: {} = {} (was: {})",
+                                    full_key, value_str, old_value
+                                )));
+                            }
+                        } else {
+                            changes_detected += 1;
+                            let _ = sender.send(Event::Registry(format!(
+                                "[RegistryMonitor] NEW: {} = {}",
+                                full_key, value_str
+                            )));
+                        }
+                    }
+                    
+                    // Check for removed values
+                    for (key_name, _) in &last_values {
+                        if key_name.starts_with(&format!("{}\\", key_name)) && !current_values.contains_key(key_name) {
+                            changes_detected += 1;
+                            let _ = sender.send(Event::Registry(format!(
+                                "[RegistryMonitor] REMOVED: {}",
+                                key_name
+                            )));
+                        }
+                    }
+                }
+            }
+            
+            // Send periodic summary
+            if last_summary_time.elapsed() > std::time::Duration::from_secs(30) {
+                if changes_detected > 0 {
+                    let _ = sender.send(Event::Registry(format!(
+                        "[RegistryMonitor] Scan #{} - {} registry changes detected",
+                        scan_count, changes_detected
+                    )));
+                }
+                last_summary_time = std::time::Instant::now();
+            }
+            
+            last_values = current_values;
+        }
     }
 }
 

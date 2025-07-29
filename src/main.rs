@@ -15,10 +15,7 @@ fn main() {
         Ok(cfg) => cfg,
         Err(e) => {
             eprintln!("[Config] Failed to load src/config/config.yaml: {}. Using defaults.", e);
-            Config {
-                log_path: "fenrirwatch.log".to_string(),
-                log_format: "json".to_string(),
-            }
+            Config::default()
         }
     };
     

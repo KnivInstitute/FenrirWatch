@@ -1,2 +1,16 @@
 log_path: fenrirwatch.log
-log_format: json 
+log_format: json
+dark_mode: true
+show_timestamps: true
+auto_scroll: true
+max_events: 1000
+selected_event_types:
+- Registry
+- Autostart
+- Service
+- Process
+event_filter: ''
+graph_max_points: 100
+export_format: JSON
+search_text: ''
+highlight_search: false
