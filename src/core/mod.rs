@@ -14,18 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::process::Command;
 use std::collections::HashMap;
 
-// Windows API imports for process monitoring
+// Windows API imports for registry monitoring
 use windows::{
-    core::GUID as WindowsGUID,
-    Win32::Foundation::{CloseHandle, BOOL},
-    Win32::System::ProcessStatus::GetModuleFileNameExW,
-    Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ},
     Win32::System::Registry::{HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER},
 };
-
-// ETW Provider GUIDs (for future ETW implementation)
-// const KERNEL_IMAGE_GUID: WindowsGUID = WindowsGUID::from_u128(0x2cb15d1d_5fc1_11d2_abe1_00a0c911f518);
-// const KERNEL_PROCESS_GUID: WindowsGUID = WindowsGUID::from_u128(0x22fb2cd6_0e7b_422b_a0c7_4fcc19da7094);
 
 // Global sender for ETW callback (wrapped in Arc<Mutex> for thread safety)
 static mut GLOBAL_SENDER: Option<Arc<Mutex<Sender<Event>>>> = None;
@@ -33,25 +25,30 @@ static mut GLOBAL_SENDER: Option<Arc<Mutex<Sender<Event>>>> = None;
 // Process information cache for parent-child relationships
 static mut PROCESS_CACHE: Option<Arc<Mutex<HashMap<u32, RealTimeProcessInfo>>>> = None;
 
-// ETW Event structures (for future ETW implementation)
-// #[repr(C)]
-// #[derive(Debug)]
-// struct ProcessEventHeader {
-//     size: u16,
-//     event_type: u16,
-//     timestamp: u64,
-//     process_id: u32,
-//     parent_process_id: u32,
-//     session_id: u32,
-//     exit_status: u32,
-//     directory_table_base: u64,
-//     user_sid_length: u32,
-//     user_sid_offset: u32,
-//     command_line_length: u32,
-//     command_line_offset: u32,
-//     image_name_length: u32,
-//     image_name_offset: u32,
-// }
+// Rate limiting for repetitive events
+static mut RATE_LIMIT_CACHE: Option<Arc<Mutex<HashMap<String, DateTime<Utc>>>>> = None;
+
+// Rate limiting helper function
+fn should_rate_limit(event_key: &str, window_seconds: i64) -> bool {
+    unsafe {
+        // Use raw pointer to avoid static mut reference warning
+        let cache_ptr = &raw const RATE_LIMIT_CACHE;
+        if let Some(cache) = (*cache_ptr).as_ref() {
+            if let Ok(mut cache) = cache.lock() {
+                let now = Utc::now();
+                if let Some(last_time) = cache.get(event_key) {
+                    if now.signed_duration_since(*last_time).num_seconds() < window_seconds {
+                        return true; // Rate limit this event
+                    }
+                }
+                cache.insert(event_key.to_string(), now);
+                return false; // Allow this event
+            }
+        }
+        false // Allow if cache is not available
+    }
+}
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProcessEventType {
@@ -83,28 +80,93 @@ pub enum Event {
 
 #[derive(Debug, Clone)]
 pub struct RealTimeProcessInfo {
+    #[allow(dead_code)]
     pub pid: u32,
     pub ppid: u32,
     pub name: String,
+    #[allow(dead_code)]
     pub command_line: Option<String>,
     pub executable_path: Option<String>,
     pub user: Option<String>,
+    #[allow(dead_code)]
     pub creation_time: std::time::SystemTime,
 }
 
+/// Process monitoring implementation using tasklist fallback
+/// 
+/// This monitor tracks process creation and termination events using the `tasklist` command
+/// as a fallback method since ETW implementation is not yet complete.
+/// 
+/// Features:
+/// - Initial process baseline establishment
+/// - Periodic scanning for new/terminated processes
+/// - Process cache management for GUI display
+/// - Rate limiting to prevent event spam
+/// - Error handling for command execution failures
 pub struct ProcessMonitor;
+
+/// Registry monitoring implementation for security-critical keys
+/// 
+/// Monitors critical registry locations for unauthorized changes that could indicate
+/// malware activity or system compromise.
+/// 
+/// Monitored locations:
+/// - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+/// - HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce
+/// - HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run
+/// - HKLM\SYSTEM\CurrentControlSet\Services
+/// - And other security-critical registry paths
 pub struct RegistryMonitor;
+
+/// Service monitoring implementation using sc command
+/// 
+/// Tracks Windows service state changes using the `sc query` command.
+/// Monitors for unauthorized service modifications that could indicate
+/// persistence mechanisms or privilege escalation attempts.
 pub struct ServiceMonitor;
+
+/// Driver monitoring implementation using driverquery command
+/// 
+/// Monitors kernel driver loading/unloading events using the `driverquery` command.
+/// Critical for detecting rootkit activity and unauthorized kernel modifications.
 pub struct DriverMonitor;
+
+/// Autostart monitoring for persistence detection
+/// 
+/// Scans registry autostart locations and startup folders to detect
+/// unauthorized persistence mechanisms that could indicate malware installation.
 pub struct AutostartMonitor;
+
+/// Hook detection for API monitoring (placeholder)
+/// 
+/// Future implementation will scan for inline hooks and API detours
+/// that could indicate monitoring evasion or malicious activity.
 pub struct HookDetector;
 
 impl ProcessMonitor {
+    /// Starts process monitoring with the provided event sender
+    /// 
+    /// This function initializes the process monitoring system and begins tracking
+    /// process creation and termination events. It uses a fallback approach with
+    /// the `tasklist` command since ETW implementation is not yet complete.
+    /// 
+    /// # Arguments
+    /// * `sender` - Channel sender for broadcasting process events
+    /// 
+    /// # Returns
+    /// * `Result<(), Box<dyn Error>>` - Success or error status
+    /// 
+    /// # Features
+    /// * Establishes initial process baseline
+    /// * Starts periodic monitoring thread
+    /// * Initializes process cache for GUI
+    /// * Implements rate limiting to prevent spam
     pub fn start_with_sender(self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
         // Initialize global sender and process cache
         unsafe {
             GLOBAL_SENDER = Some(Arc::new(Mutex::new(sender.clone())));
             PROCESS_CACHE = Some(Arc::new(Mutex::new(HashMap::new())));
+            RATE_LIMIT_CACHE = Some(Arc::new(Mutex::new(HashMap::new())));
         }
 
         let _ = sender.send(Event::Process(ProcessEvent {
@@ -138,7 +200,9 @@ impl ProcessMonitor {
                     if let Some(process_info) = parse_tasklist_line(line) {
                         // Add to cache
                         unsafe {
-                            if let Some(cache) = &PROCESS_CACHE {
+                            // Use raw pointer to avoid static mut reference warning
+                            let cache_ptr = &raw const PROCESS_CACHE;
+                            if let Some(cache) = (*cache_ptr).as_ref() {
                                 if let Ok(mut cache) = cache.lock() {
                                     cache.insert(process_info.pid, RealTimeProcessInfo {
                                         pid: process_info.pid,
@@ -286,42 +350,52 @@ impl ServiceMonitor {
         let _ = sender.send(Event::Service("[ServiceMonitor] Starting service monitoring...".to_string()));
 
         // Get initial services using sc query
-        if let Ok(output) = Command::new("sc").args(&["query", "type=", "service", "state=", "all"]).output() {
-            if let Ok(output_str) = String::from_utf8(output.stdout) {
-                let mut service_count = 0;
-                let mut current_service = String::new();
-                let mut current_state = String::new();
-                
-                for line in output_str.lines() {
-                    if line.starts_with("SERVICE_NAME:") {
-                        if !current_service.is_empty() && !current_state.is_empty() {
-                            let _ = sender.send(Event::Service(format!(
-                                "[ServiceMonitor] Service: {} | State: {}",
-                                current_service.trim(), current_state.trim()
-                            )));
-                            service_count += 1;
-                        }
-                        current_service = line.replace("SERVICE_NAME:", "").trim().to_string();
-                        current_state = String::new();
-                    } else if line.trim().starts_with("STATE") {
-                        if let Some(state) = line.split_whitespace().nth(1) {
-                            current_state = state.to_string();
+        match Command::new("sc").args(&["query", "type=", "service", "state=", "all"]).output() {
+            Ok(output) => {
+                if let Ok(output_str) = String::from_utf8(output.stdout) {
+                    let mut service_count = 0;
+                    let mut current_service = String::new();
+                    let mut current_state = String::new();
+                    
+                    for line in output_str.lines() {
+                        if line.starts_with("SERVICE_NAME:") {
+                            if !current_service.is_empty() && !current_state.is_empty() {
+                                let _ = sender.send(Event::Service(format!(
+                                    "[ServiceMonitor] Service: {} | State: {}",
+                                    current_service.trim(), current_state.trim()
+                                )));
+                                service_count += 1;
+                            }
+                            current_service = line.replace("SERVICE_NAME:", "").trim().to_string();
+                            current_state = String::new();
+                        } else if line.trim().starts_with("STATE") {
+                            if let Some(state) = line.split_whitespace().nth(1) {
+                                current_state = state.to_string();
+                            }
                         }
                     }
-                }
-                
-                // Send the last service
-                if !current_service.is_empty() && !current_state.is_empty() {
+                    
+                    // Send the last service
+                    if !current_service.is_empty() && !current_state.is_empty() {
+                        let _ = sender.send(Event::Service(format!(
+                            "[ServiceMonitor] Service: {} | State: {}",
+                            current_service.trim(), current_state.trim()
+                        )));
+                        service_count += 1;
+                    }
+                    
                     let _ = sender.send(Event::Service(format!(
-                        "[ServiceMonitor] Service: {} | State: {}",
-                        current_service.trim(), current_state.trim()
+                        "[ServiceMonitor] Found {} active services via sc command",
+                        service_count
                     )));
-                    service_count += 1;
+                } else {
+                    let _ = sender.send(Event::Service("[ServiceMonitor] Error: Failed to parse sc command output".to_string()));
                 }
-                
+            }
+            Err(e) => {
                 let _ = sender.send(Event::Service(format!(
-                    "[ServiceMonitor] Found {} active services via sc command",
-                    service_count
+                    "[ServiceMonitor] Error: Failed to execute sc command: {}",
+                    e
                 )));
             }
         }
@@ -334,44 +408,52 @@ impl ServiceMonitor {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 
-                if let Ok(output) = Command::new("sc").args(&["query", "type=", "service", "state=", "all"]).output() {
-                    if let Ok(output_str) = String::from_utf8(output.stdout) {
-                        let mut current_services = HashMap::new();
-                        let mut current_service = String::new();
-                        let mut current_state = String::new();
-                        
-                        for line in output_str.lines() {
-                            if line.starts_with("SERVICE_NAME:") {
-                                if !current_service.is_empty() && !current_state.is_empty() {
-                                    current_services.insert(current_service.trim().to_string(), current_state.trim().to_string());
-                                }
-                                current_service = line.replace("SERVICE_NAME:", "").trim().to_string();
-                                current_state = String::new();
-                            } else if line.trim().starts_with("STATE") {
-                                if let Some(state) = line.split_whitespace().nth(1) {
-                                    current_state = state.to_string();
-                                }
-                            }
-                        }
-                        
-                        // Process the last service
-                        if !current_service.is_empty() && !current_state.is_empty() {
-                            current_services.insert(current_service.trim().to_string(), current_state.trim().to_string());
-                        }
-                        
-                        // Check for service state changes
-                        for (name, state) in &current_services {
-                            if let Some(old_state) = last_services.get(name) {
-                                if old_state != state {
-                                    let _ = sender_clone.send(Event::Service(format!(
-                                        "[ServiceMonitor] Service changed: {} | Old State: {} | New State: {}",
-                                        name, old_state, state
-                                    )));
+                match Command::new("sc").args(&["query", "type=", "service", "state=", "all"]).output() {
+                    Ok(output) => {
+                        if let Ok(output_str) = String::from_utf8(output.stdout) {
+                            let mut current_services = HashMap::new();
+                            let mut current_service = String::new();
+                            let mut current_state = String::new();
+                            
+                            for line in output_str.lines() {
+                                if line.starts_with("SERVICE_NAME:") {
+                                    if !current_service.is_empty() && !current_state.is_empty() {
+                                        current_services.insert(current_service.trim().to_string(), current_state.trim().to_string());
+                                    }
+                                    current_service = line.replace("SERVICE_NAME:", "").trim().to_string();
+                                    current_state = String::new();
+                                } else if line.trim().starts_with("STATE") {
+                                    if let Some(state) = line.split_whitespace().nth(1) {
+                                        current_state = state.to_string();
+                                    }
                                 }
                             }
+                            
+                            // Process the last service
+                            if !current_service.is_empty() && !current_state.is_empty() {
+                                current_services.insert(current_service.trim().to_string(), current_state.trim().to_string());
+                            }
+                            
+                            // Check for service state changes
+                            for (name, state) in &current_services {
+                                if let Some(old_state) = last_services.get(name) {
+                                    if old_state != state {
+                                        let _ = sender_clone.send(Event::Service(format!(
+                                            "[ServiceMonitor] Service changed: {} | Old State: {} | New State: {}",
+                                            name, old_state, state
+                                        )));
+                                    }
+                                }
+                            }
+                            
+                            last_services = current_services;
+                        } else {
+                            eprintln!("[ServiceMonitor] Error: Failed to parse sc command output");
                         }
-                        
-                        last_services = current_services;
+                    }
+                    Err(e) => {
+                        eprintln!("[ServiceMonitor] Error: Failed to execute sc command: {}", e);
+                        std::thread::sleep(std::time::Duration::from_secs(10)); // Wait longer on error
                     }
                 }
             }
@@ -458,30 +540,39 @@ impl RegistryMonitor {
                         if let Some(old_value) = last_values.get(&full_key) {
                             if old_value != &value_str {
                                 changes_detected += 1;
-                                let _ = sender.send(Event::Registry(format!(
-                                    "[RegistryMonitor] CHANGED: {} = {} (was: {})",
-                                    full_key, value_str, old_value
-                                )));
+                                let event_key = format!("registry_changed_{}", full_key);
+                                if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
+                                    let _ = sender.send(Event::Registry(format!(
+                                        "[RegistryMonitor] CHANGED: {} = {} (was: {})",
+                                        full_key, value_str, old_value
+                                    )));
+                                }
                             }
                         } else {
                             changes_detected += 1;
-                            let _ = sender.send(Event::Registry(format!(
-                                "[RegistryMonitor] NEW: {} = {}",
-                                full_key, value_str
-                            )));
+                            let event_key = format!("registry_new_{}", full_key);
+                            if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
+                                let _ = sender.send(Event::Registry(format!(
+                                    "[RegistryMonitor] NEW: {} = {}",
+                                    full_key, value_str
+                                )));
+                            }
                         }
                     }
                     
-                    // Check for removed values
-                    for (key_name, _) in &last_values {
-                        if key_name.starts_with(&format!("{}\\", key_name)) && !current_values.contains_key(key_name) {
-                            changes_detected += 1;
-                            let _ = sender.send(Event::Registry(format!(
-                                "[RegistryMonitor] REMOVED: {}",
-                                key_name
-                            )));
+                                            // Check for removed values
+                        for (key_name, _) in &last_values {
+                            if key_name.starts_with(&format!("{}\\", key_name)) && !current_values.contains_key(key_name) {
+                                changes_detected += 1;
+                                let event_key = format!("registry_removed_{}", key_name);
+                                if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
+                                    let _ = sender.send(Event::Registry(format!(
+                                        "[RegistryMonitor] REMOVED: {}",
+                                        key_name
+                                    )));
+                                }
+                            }
                         }
-                    }
                 }
             }
             
@@ -510,22 +601,32 @@ impl DriverMonitor {
         let _ = sender.send(Event::Driver("[DriverMonitor] Starting driver monitoring...".to_string()));
 
         // Get initial drivers using driverquery command
-        if let Ok(output) = Command::new("driverquery").args(&["/FO", "CSV", "/NH"]).output() {
-            if let Ok(output_str) = String::from_utf8(output.stdout) {
-                let mut driver_count = 0;
-                for line in output_str.lines().take(20) {
-                    if let Some(driver_info) = parse_driverquery_line(line) {
-                        let _ = sender.send(Event::Driver(format!(
-                            "[DriverMonitor] Initial Driver: {} | State: {} | Path: {}",
-                            driver_info.name, driver_info.state, driver_info.path
-                        )));
-                        driver_count += 1;
+        match Command::new("driverquery").args(&["/FO", "CSV", "/NH"]).output() {
+            Ok(output) => {
+                if let Ok(output_str) = String::from_utf8(output.stdout) {
+                    let mut driver_count = 0;
+                    for line in output_str.lines().take(20) {
+                        if let Some(driver_info) = parse_driverquery_line(line) {
+                            let _ = sender.send(Event::Driver(format!(
+                                "[DriverMonitor] Initial Driver: {} | State: {} | Path: {}",
+                                driver_info.name, driver_info.state, driver_info.path
+                            )));
+                            driver_count += 1;
+                        }
                     }
+                    
+                    let _ = sender.send(Event::Driver(format!(
+                        "[DriverMonitor] Found {} active drivers via driverquery",
+                        driver_count
+                    )));
+                } else {
+                    let _ = sender.send(Event::Driver("[DriverMonitor] Error: Failed to parse driverquery output".to_string()));
                 }
-                
+            }
+            Err(e) => {
                 let _ = sender.send(Event::Driver(format!(
-                    "[DriverMonitor] Found {} active drivers via driverquery",
-                    driver_count
+                    "[DriverMonitor] Error: Failed to execute driverquery command: {}",
+                    e
                 )));
             }
         }
@@ -540,50 +641,58 @@ impl DriverMonitor {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 scan_count += 1;
                 
-                if let Ok(output) = Command::new("driverquery").args(&["/FO", "CSV", "/NH"]).output() {
-                    if let Ok(output_str) = String::from_utf8(output.stdout) {
-                        let current_drivers: HashMap<String, String> = output_str
-                            .lines()
-                            .filter_map(|line| parse_driverquery_line(line))
-                            .map(|info| (info.name.clone(), info.state))
-                            .collect();
-                        
-                        // Send periodic scan info for testing
-                        if scan_count % 3 == 0 {
-                            let _ = sender_clone.send(Event::Driver(format!(
-                                "[DriverMonitor] Periodic scan #{} - Found {} drivers",
-                                scan_count, current_drivers.len()
-                            )));
-                        }
-                        
-                        // Check for new drivers
-                        for (name, state) in &current_drivers {
-                            if !last_drivers.contains_key(name) {
+                match Command::new("driverquery").args(&["/FO", "CSV", "/NH"]).output() {
+                    Ok(output) => {
+                        if let Ok(output_str) = String::from_utf8(output.stdout) {
+                            let current_drivers: HashMap<String, String> = output_str
+                                .lines()
+                                .filter_map(|line| parse_driverquery_line(line))
+                                .map(|info| (info.name.clone(), info.state))
+                                .collect();
+                            
+                            // Send periodic scan info for testing
+                            if scan_count % 3 == 0 {
                                 let _ = sender_clone.send(Event::Driver(format!(
-                                    "[DriverMonitor] NEW DRIVER DETECTED: {} | State: {}",
-                                    name, state
+                                    "[DriverMonitor] Periodic scan #{} - Found {} drivers",
+                                    scan_count, current_drivers.len()
                                 )));
-                            } else if let Some(old_state) = last_drivers.get(name) {
-                                if old_state != state {
+                            }
+                            
+                            // Check for new drivers
+                            for (name, state) in &current_drivers {
+                                if !last_drivers.contains_key(name) {
                                     let _ = sender_clone.send(Event::Driver(format!(
-                                        "[DriverMonitor] Driver changed: {} | Old State: {} | New State: {}",
-                                        name, old_state, state
+                                        "[DriverMonitor] NEW DRIVER DETECTED: {} | State: {}",
+                                        name, state
+                                    )));
+                                } else if let Some(old_state) = last_drivers.get(name) {
+                                    if old_state != state {
+                                        let _ = sender_clone.send(Event::Driver(format!(
+                                            "[DriverMonitor] Driver changed: {} | Old State: {} | New State: {}",
+                                            name, old_state, state
+                                        )));
+                                    }
+                                }
+                            }
+                            
+                            // Check for removed drivers
+                            for (name, _) in &last_drivers {
+                                if !current_drivers.contains_key(name) {
+                                    let _ = sender_clone.send(Event::Driver(format!(
+                                        "[DriverMonitor] DRIVER REMOVED: {}",
+                                        name
                                     )));
                                 }
                             }
+                            
+                            last_drivers = current_drivers;
+                        } else {
+                            eprintln!("[DriverMonitor] Error: Failed to parse driverquery output");
                         }
-                        
-                        // Check for removed drivers
-                        for (name, _) in &last_drivers {
-                            if !current_drivers.contains_key(name) {
-                                let _ = sender_clone.send(Event::Driver(format!(
-                                    "[DriverMonitor] DRIVER REMOVED: {}",
-                                    name
-                                )));
-                            }
-                        }
-                        
-                        last_drivers = current_drivers;
+                    }
+                    Err(e) => {
+                        eprintln!("[DriverMonitor] Error: Failed to execute driverquery command: {}", e);
+                        std::thread::sleep(std::time::Duration::from_secs(10)); // Wait longer on error
                     }
                 }
             }
@@ -621,8 +730,11 @@ impl AutostartMonitor {
             let key = RegKey::predef(hive);
             if let Ok(subkey_handle) = key.open_subkey(subkey) {
                 for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
-                    let msg = format!("Registry: {} = {:?}", name, value);
-                    let _ = sender.send(Event::Autostart(msg));
+                    let event_key = format!("autostart_registry_{}_{}", hive, name);
+                    if !should_rate_limit(&event_key, 300) { // Rate limit to 5 minutes
+                        let msg = format!("Registry: {} = {:?}", name, value);
+                        let _ = sender.send(Event::Autostart(msg));
+                    }
                 }
             }
         }
@@ -638,8 +750,11 @@ impl AutostartMonitor {
                 for entry in entries.filter_map(|x| x.ok()) {
                     let path = entry.path();
                     if let Some(file_name) = path.file_name() {
-                        let msg = format!("Startup folder: {}", file_name.to_string_lossy());
-                        let _ = sender.send(Event::Autostart(msg));
+                        let event_key = format!("autostart_folder_{}", file_name.to_string_lossy());
+                        if !should_rate_limit(&event_key, 300) { // Rate limit to 5 minutes
+                            let msg = format!("Startup folder: {}", file_name.to_string_lossy());
+                            let _ = sender.send(Event::Autostart(msg));
+                        }
                     }
                 }
             }
@@ -697,38 +812,14 @@ fn parse_driverquery_line(line: &str) -> Option<DriverInfo> {
     None
 }
 
-// Helper functions for process information (for future ETW implementation)
-// unsafe fn get_process_executable_path(pid: u32) -> Option<String> {
-//     let handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, BOOL::from(false), pid);
-//     if handle.is_ok() {
-//         let handle = handle.unwrap();
-//         let mut buffer = [0u16; 260];
-//         let result = GetModuleFileNameExW(handle, None, &mut buffer);
-//         let _ = CloseHandle(handle);
-//         
-//         if result > 0 {
-//             let path = String::from_utf16_lossy(&buffer[..result as usize]);
-//             Some(path)
-//         } else {
-//             None
-//         }
-//     } else {
-//         None
-//     }
-// }
-// 
-// unsafe fn get_process_name_from_path(path: &str) -> String {
-//     if let Some(file_name) = std::path::Path::new(path).file_name() {
-//         file_name.to_string_lossy().to_string()
-//     } else {
-//         "Unknown".to_string()
-//     }
-// }
+
 
 // Process tree and details functions for GUI
 pub fn get_process_tree() -> Vec<(u32, u32, String)> {
     unsafe {
-        if let Some(cache) = &PROCESS_CACHE {
+        // Use raw pointer to avoid static mut reference warning
+        let cache_ptr = &raw const PROCESS_CACHE;
+        if let Some(cache) = (*cache_ptr).as_ref() {
             if let Ok(cache) = cache.lock() {
                 return cache.iter()
                     .map(|(pid, info)| (*pid, info.ppid, info.name.clone()))
@@ -741,7 +832,9 @@ pub fn get_process_tree() -> Vec<(u32, u32, String)> {
 
 pub fn get_process_details(pid: u32) -> Option<RealTimeProcessInfo> {
     unsafe {
-        if let Some(cache) = &PROCESS_CACHE {
+        // Use raw pointer to avoid static mut reference warning
+        let cache_ptr = &raw const PROCESS_CACHE;
+        if let Some(cache) = (*cache_ptr).as_ref() {
             if let Ok(cache) = cache.lock() {
                 return cache.get(&pid).cloned();
             }
@@ -761,9 +854,44 @@ impl EventLogger {
                 .append(true)
                 .open(&log_path);
 
+            // Log rotation settings
+            const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+            let mut event_count = 0;
+            const ROTATION_CHECK_INTERVAL: usize = 100; // Check every 100 events
+
             match file {
                 Ok(mut file) => {
                     for event in receiver.iter() {
+                        event_count += 1;
+                        
+                        // Check for log rotation
+                        if event_count % ROTATION_CHECK_INTERVAL == 0 {
+                            if let Ok(metadata) = std::fs::metadata(&log_path) {
+                                if metadata.len() > MAX_LOG_SIZE {
+                                    // Rotate log file
+                                    let backup_path = format!("{}.backup", log_path);
+                                    let _ = std::fs::rename(&log_path, &backup_path);
+                                    
+                                    // Create new log file
+                                    file = match OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&log_path) {
+                                        Ok(new_file) => new_file,
+                                        Err(e) => {
+                                            eprintln!("[EventLogger] Failed to create new log file: {}", e);
+                                            continue;
+                                        }
+                                    };
+                                    
+                                    // Log rotation event
+                                    if let Ok(json) = serde_json::to_string(&Event::Registry("[EventLogger] Log file rotated due to size limit".to_string())) {
+                                        let _ = writeln!(file, "{}", json);
+                                    }
+                                }
+                            }
+                        }
+                        
                         if let Ok(json) = serde_json::to_string(&event) {
                             if let Err(e) = writeln!(file, "{}", json) {
                                 eprintln!("[EventLogger] Failed to write to log: {}", e);
