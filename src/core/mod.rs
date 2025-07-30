@@ -161,6 +161,7 @@ impl ProcessMonitor {
     /// * Starts periodic monitoring thread
     /// * Initializes process cache for GUI
     /// * Implements rate limiting to prevent spam
+    /// * Enhanced error handling and recovery
     pub fn start_with_sender(self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
         // Initialize global sender and process cache
         unsafe {
@@ -257,6 +258,8 @@ impl ProcessMonitor {
         let mut last_processes: HashMap<u32, String> = HashMap::new();
         let mut scan_count = 0;
         let mut last_summary_time = std::time::Instant::now();
+        let mut consecutive_errors = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 5;
         
         loop {
             // Sleep longer to reduce resource usage
@@ -275,13 +278,14 @@ impl ProcessMonitor {
                         
                         let mut new_processes = 0;
                         let mut terminated_processes = 0;
+                        let mut event_errors = 0;
                         
                         // Find new processes (limit to prevent spam)
                         for (pid, name) in &current_processes {
                             if !last_processes.contains_key(pid) {
                                 new_processes += 1;
                                 if new_processes <= 10 { // Limit events per scan
-                                    let _ = sender.send(Event::Process(ProcessEvent {
+                                    if let Err(e) = sender.send(Event::Process(ProcessEvent {
                                         event_type: ProcessEventType::Created,
                                         pid: *pid,
                                         ppid: 0,
@@ -290,7 +294,10 @@ impl ProcessMonitor {
                                         executable_path: None,
                                         user: Some("system".to_string()),
                                         timestamp: Utc::now(),
-                                    }));
+                                    })) {
+                                        eprintln!("[ProcessMonitor] Failed to send new process event: {:?}", e);
+                                        event_errors += 1;
+                                    }
                                 }
                             }
                         }
@@ -300,7 +307,7 @@ impl ProcessMonitor {
                             if !current_processes.contains_key(pid) {
                                 terminated_processes += 1;
                                 if terminated_processes <= 10 { // Limit events per scan
-                                    let _ = sender.send(Event::Process(ProcessEvent {
+                                    if let Err(e) = sender.send(Event::Process(ProcessEvent {
                                         event_type: ProcessEventType::Terminated,
                                         pid: *pid,
                                         ppid: 0,
@@ -309,7 +316,10 @@ impl ProcessMonitor {
                                         executable_path: None,
                                         user: Some("system".to_string()),
                                         timestamp: Utc::now(),
-                                    }));
+                                    })) {
+                                        eprintln!("[ProcessMonitor] Failed to send terminated process event: {:?}", e);
+                                        event_errors += 1;
+                                    }
                                 }
                             }
                         }
@@ -317,7 +327,7 @@ impl ProcessMonitor {
                         // Send summary every 30 seconds instead of individual events
                         if last_summary_time.elapsed() > std::time::Duration::from_secs(30) {
                             if new_processes > 0 || terminated_processes > 0 {
-                                let _ = sender.send(Event::Process(ProcessEvent {
+                                if let Err(e) = sender.send(Event::Process(ProcessEvent {
                                     event_type: ProcessEventType::Created,
                                     pid: 0,
                                     ppid: 0,
@@ -327,18 +337,64 @@ impl ProcessMonitor {
                                     executable_path: None,
                                     user: Some("system".to_string()),
                                     timestamp: Utc::now(),
-                                }));
+                                })) {
+                                    eprintln!("[ProcessMonitor] Failed to send summary event: {:?}", e);
+                                    event_errors += 1;
+                                }
                             }
                             last_summary_time = std::time::Instant::now();
                         }
                         
+                        // Reset error count on successful scan
+                        if event_errors == 0 {
+                            consecutive_errors = 0;
+                        } else {
+                            consecutive_errors += 1;
+                        }
+                        
                         last_processes = current_processes;
+                    } else {
+                        consecutive_errors += 1;
+                        eprintln!("[ProcessMonitor] Failed to parse tasklist output");
                     }
                 }
                 Err(e) => {
-                    // Log error but don't crash
+                    consecutive_errors += 1;
                     eprintln!("[ProcessMonitor] Error running tasklist: {}", e);
-                    std::thread::sleep(std::time::Duration::from_secs(10)); // Wait longer on error
+                    
+                    // Send error event if we haven't had too many consecutive errors
+                    if consecutive_errors <= MAX_CONSECUTIVE_ERRORS {
+                        let _ = sender.send(Event::Process(ProcessEvent {
+                            event_type: ProcessEventType::Created,
+                            pid: 0,
+                            ppid: 0,
+                            name: format!("ProcessMonitor: Error - {}", e),
+                            command_line: Some("Tasklist command failed".to_string()),
+                            executable_path: None,
+                            user: Some("system".to_string()),
+                            timestamp: Utc::now(),
+                        }));
+                    }
+                    
+                    // Exponential backoff on consecutive errors
+                    let backoff_duration = std::time::Duration::from_secs(10 * 2u64.pow(consecutive_errors.min(3)));
+                    std::thread::sleep(backoff_duration);
+                    
+                    // Stop if too many consecutive errors
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        eprintln!("[ProcessMonitor] Too many consecutive errors, stopping process monitoring");
+                        let _ = sender.send(Event::Process(ProcessEvent {
+                            event_type: ProcessEventType::Created,
+                            pid: 0,
+                            ppid: 0,
+                            name: "ProcessMonitor: Stopped due to excessive errors".to_string(),
+                            command_line: Some("Monitoring stopped".to_string()),
+                            executable_path: None,
+                            user: Some("system".to_string()),
+                            timestamp: Utc::now(),
+                        }));
+                        break;
+                    }
                 }
             }
         }
@@ -347,7 +403,9 @@ impl ProcessMonitor {
 
 impl ServiceMonitor {
     pub fn start_with_sender(self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
-        let _ = sender.send(Event::Service("[ServiceMonitor] Starting service monitoring...".to_string()));
+        if let Err(e) = sender.send(Event::Service("[ServiceMonitor] Starting service monitoring...".to_string())) {
+            eprintln!("[ServiceMonitor] Failed to send start event: {:?}", e);
+        }
 
         // Get initial services using sc query
         match Command::new("sc").args(&["query", "type=", "service", "state=", "all"]).output() {
@@ -356,15 +414,20 @@ impl ServiceMonitor {
                     let mut service_count = 0;
                     let mut current_service = String::new();
                     let mut current_state = String::new();
+                    let mut event_errors = 0;
                     
                     for line in output_str.lines() {
                         if line.starts_with("SERVICE_NAME:") {
                             if !current_service.is_empty() && !current_state.is_empty() {
-                                let _ = sender.send(Event::Service(format!(
+                                if let Err(e) = sender.send(Event::Service(format!(
                                     "[ServiceMonitor] Service: {} | State: {}",
                                     current_service.trim(), current_state.trim()
-                                )));
-                                service_count += 1;
+                                ))) {
+                                    eprintln!("[ServiceMonitor] Failed to send service event: {:?}", e);
+                                    event_errors += 1;
+                                } else {
+                                    service_count += 1;
+                                }
                             }
                             current_service = line.replace("SERVICE_NAME:", "").trim().to_string();
                             current_state = String::new();
@@ -377,26 +440,36 @@ impl ServiceMonitor {
                     
                     // Send the last service
                     if !current_service.is_empty() && !current_state.is_empty() {
-                        let _ = sender.send(Event::Service(format!(
+                        if let Err(e) = sender.send(Event::Service(format!(
                             "[ServiceMonitor] Service: {} | State: {}",
                             current_service.trim(), current_state.trim()
-                        )));
-                        service_count += 1;
+                        ))) {
+                            eprintln!("[ServiceMonitor] Failed to send final service event: {:?}", e);
+                            event_errors += 1;
+                        } else {
+                            service_count += 1;
+                        }
                     }
                     
-                    let _ = sender.send(Event::Service(format!(
-                        "[ServiceMonitor] Found {} active services via sc command",
-                        service_count
-                    )));
+                    if let Err(e) = sender.send(Event::Service(format!(
+                        "[ServiceMonitor] Found {} active services via sc command ({} event errors)",
+                        service_count, event_errors
+                    ))) {
+                        eprintln!("[ServiceMonitor] Failed to send summary event: {:?}", e);
+                    }
                 } else {
-                    let _ = sender.send(Event::Service("[ServiceMonitor] Error: Failed to parse sc command output".to_string()));
+                    if let Err(e) = sender.send(Event::Service("[ServiceMonitor] Error: Failed to parse sc command output".to_string())) {
+                        eprintln!("[ServiceMonitor] Failed to send parse error event: {:?}", e);
+                    }
                 }
             }
             Err(e) => {
-                let _ = sender.send(Event::Service(format!(
+                if let Err(send_err) = sender.send(Event::Service(format!(
                     "[ServiceMonitor] Error: Failed to execute sc command: {}",
                     e
-                )));
+                ))) {
+                    eprintln!("[ServiceMonitor] Failed to send command error event: {:?}", send_err);
+                }
             }
         }
 
@@ -404,6 +477,8 @@ impl ServiceMonitor {
         let sender_clone = sender.clone();
         std::thread::spawn(move || {
             let mut last_services = HashMap::new();
+            let mut consecutive_errors = 0;
+            const MAX_CONSECUTIVE_ERRORS: u32 = 5;
             
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(10));
@@ -414,6 +489,7 @@ impl ServiceMonitor {
                             let mut current_services = HashMap::new();
                             let mut current_service = String::new();
                             let mut current_state = String::new();
+                            let mut event_errors = 0;
                             
                             for line in output_str.lines() {
                                 if line.starts_with("SERVICE_NAME:") {
@@ -438,22 +514,55 @@ impl ServiceMonitor {
                             for (name, state) in &current_services {
                                 if let Some(old_state) = last_services.get(name) {
                                     if old_state != state {
-                                        let _ = sender_clone.send(Event::Service(format!(
+                                        if let Err(e) = sender_clone.send(Event::Service(format!(
                                             "[ServiceMonitor] Service changed: {} | Old State: {} | New State: {}",
                                             name, old_state, state
-                                        )));
+                                        ))) {
+                                            eprintln!("[ServiceMonitor] Failed to send service change event: {:?}", e);
+                                            event_errors += 1;
+                                        }
                                     }
                                 }
                             }
                             
+                            // Reset error count on successful scan
+                            if event_errors == 0 {
+                                consecutive_errors = 0;
+                            } else {
+                                consecutive_errors += 1;
+                            }
+                            
                             last_services = current_services;
                         } else {
+                            consecutive_errors += 1;
                             eprintln!("[ServiceMonitor] Error: Failed to parse sc command output");
+                            
+                            if consecutive_errors <= MAX_CONSECUTIVE_ERRORS {
+                                let _ = sender_clone.send(Event::Service("[ServiceMonitor] Error: Failed to parse sc command output".to_string()));
+                            }
                         }
                     }
                     Err(e) => {
+                        consecutive_errors += 1;
                         eprintln!("[ServiceMonitor] Error: Failed to execute sc command: {}", e);
-                        std::thread::sleep(std::time::Duration::from_secs(10)); // Wait longer on error
+                        
+                        if consecutive_errors <= MAX_CONSECUTIVE_ERRORS {
+                            let _ = sender_clone.send(Event::Service(format!(
+                                "[ServiceMonitor] Error: Failed to execute sc command: {}",
+                                e
+                            )));
+                        }
+                        
+                        // Exponential backoff on consecutive errors
+                        let backoff_duration = std::time::Duration::from_secs(10 * 2u64.pow(consecutive_errors.min(3)));
+                        std::thread::sleep(backoff_duration);
+                        
+                        // Stop if too many consecutive errors
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            eprintln!("[ServiceMonitor] Too many consecutive errors, stopping service monitoring");
+                            let _ = sender_clone.send(Event::Service("[ServiceMonitor] Stopped due to excessive errors".to_string()));
+                            break;
+                        }
                     }
                 }
             }
@@ -469,7 +578,9 @@ impl RegistryMonitor {
     }
 
     pub fn start_with_sender(&mut self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
-        let _ = sender.send(Event::Registry("[RegistryMonitor] Starting real-time registry monitoring...".to_string()));
+        if let Err(e) = sender.send(Event::Registry("[RegistryMonitor] Starting real-time registry monitoring...".to_string())) {
+            eprintln!("[RegistryMonitor] Failed to send start event: {:?}", e);
+        }
 
         // Critical registry keys to monitor for security
         let critical_keys = vec![
@@ -486,20 +597,47 @@ impl RegistryMonitor {
         ];
 
         // Initial scan of critical keys
+        let mut event_errors = 0;
         for (hive, subkey) in &critical_keys {
             let key = RegKey::predef(*hive);
-            if let Ok(subkey_handle) = key.open_subkey_with_flags(subkey, KEY_READ) {
-                let _ = sender.send(Event::Registry(format!(
-                    "[RegistryMonitor] Monitoring: {}",
-                    subkey
-                )));
-                
-                // Enumerate initial values
-                for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
-                    let msg = format!("Initial: {} = {:?}", name, value);
-                    let _ = sender.send(Event::Registry(msg));
+            match key.open_subkey_with_flags(subkey, KEY_READ) {
+                Ok(subkey_handle) => {
+                    if let Err(e) = sender.send(Event::Registry(format!(
+                        "[RegistryMonitor] Monitoring: {}",
+                        subkey
+                    ))) {
+                        eprintln!("[RegistryMonitor] Failed to send monitoring event: {:?}", e);
+                        event_errors += 1;
+                    }
+                    
+                    // Enumerate initial values
+                    for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
+                        let msg = format!("Initial: {} = {:?}", name, value);
+                        if let Err(e) = sender.send(Event::Registry(msg)) {
+                            eprintln!("[RegistryMonitor] Failed to send initial value event: {:?}", e);
+                            event_errors += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[RegistryMonitor] Failed to access registry key {}: {:?}", subkey, e);
+                    if let Err(send_err) = sender.send(Event::Registry(format!(
+                        "[RegistryMonitor] Error accessing: {} - {:?}",
+                        subkey, e
+                    ))) {
+                        eprintln!("[RegistryMonitor] Failed to send registry error event: {:?}", send_err);
+                        event_errors += 1;
+                    }
                 }
             }
+        }
+
+        // Send summary of initial scan
+        if let Err(e) = sender.send(Event::Registry(format!(
+            "[RegistryMonitor] Initial scan completed with {} event errors",
+            event_errors
+        ))) {
+            eprintln!("[RegistryMonitor] Failed to send initial scan summary: {:?}", e);
         }
 
         // Start enhanced periodic monitoring
@@ -515,6 +653,8 @@ impl RegistryMonitor {
         let mut last_values: HashMap<String, String> = HashMap::new();
         let mut scan_count = 0;
         let mut last_summary_time = std::time::Instant::now();
+        let mut consecutive_errors = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
         
         loop {
             std::thread::sleep(std::time::Duration::from_secs(3)); // More frequent scanning
@@ -522,69 +662,103 @@ impl RegistryMonitor {
             
             let mut current_values: HashMap<String, String> = HashMap::new();
             let mut changes_detected = 0;
+            let mut event_errors = 0;
+            let mut scan_successful = true;
             
             for (hive, subkey) in &critical_keys {
                 let key = RegKey::predef(*hive);
-                if let Ok(subkey_handle) = key.open_subkey_with_flags(subkey, KEY_READ) {
-                    let key_name = format!("{}\\{}", 
-                        if *hive == HKEY_LOCAL_MACHINE.0 as isize { "HKLM" } else { "HKCU" }, 
-                        subkey
-                    );
-                    
-                    for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
-                        let full_key = format!("{}\\{}", key_name, name);
-                        let value_str = format!("{:?}", value);
-                        current_values.insert(full_key.clone(), value_str.clone());
+                match key.open_subkey_with_flags(subkey, KEY_READ) {
+                    Ok(subkey_handle) => {
+                        let key_name = format!("{}\\{}", 
+                            if *hive == HKEY_LOCAL_MACHINE.0 as isize { "HKLM" } else { "HKCU" }, 
+                            subkey
+                        );
                         
-                        // Check for new or changed values
-                        if let Some(old_value) = last_values.get(&full_key) {
-                            if old_value != &value_str {
+                        for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
+                            let full_key = format!("{}\\{}", key_name, name);
+                            let value_str = format!("{:?}", value);
+                            current_values.insert(full_key.clone(), value_str.clone());
+                            
+                            // Check for new or changed values
+                            if let Some(old_value) = last_values.get(&full_key) {
+                                if old_value != &value_str {
+                                    changes_detected += 1;
+                                    let event_key = format!("registry_changed_{}", full_key);
+                                    if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
+                                        if let Err(e) = sender.send(Event::Registry(format!(
+                                            "[RegistryMonitor] CHANGED: {} = {} (was: {})",
+                                            full_key, value_str, old_value
+                                        ))) {
+                                            eprintln!("[RegistryMonitor] Failed to send change event: {:?}", e);
+                                            event_errors += 1;
+                                        }
+                                    }
+                                }
+                            } else {
                                 changes_detected += 1;
-                                let event_key = format!("registry_changed_{}", full_key);
+                                let event_key = format!("registry_new_{}", full_key);
                                 if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
-                                    let _ = sender.send(Event::Registry(format!(
-                                        "[RegistryMonitor] CHANGED: {} = {} (was: {})",
-                                        full_key, value_str, old_value
-                                    )));
+                                    if let Err(e) = sender.send(Event::Registry(format!(
+                                        "[RegistryMonitor] NEW: {} = {}",
+                                        full_key, value_str
+                                    ))) {
+                                        eprintln!("[RegistryMonitor] Failed to send new value event: {:?}", e);
+                                        event_errors += 1;
+                                    }
                                 }
                             }
-                        } else {
-                            changes_detected += 1;
-                            let event_key = format!("registry_new_{}", full_key);
-                            if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
-                                let _ = sender.send(Event::Registry(format!(
-                                    "[RegistryMonitor] NEW: {} = {}",
-                                    full_key, value_str
-                                )));
-                            }
                         }
-                    }
-                    
-                                            // Check for removed values
+                        
+                        // Check for removed values
                         for (key_name, _) in &last_values {
                             if key_name.starts_with(&format!("{}\\", key_name)) && !current_values.contains_key(key_name) {
                                 changes_detected += 1;
                                 let event_key = format!("registry_removed_{}", key_name);
                                 if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
-                                    let _ = sender.send(Event::Registry(format!(
+                                    if let Err(e) = sender.send(Event::Registry(format!(
                                         "[RegistryMonitor] REMOVED: {}",
                                         key_name
-                                    )));
+                                    ))) {
+                                        eprintln!("[RegistryMonitor] Failed to send removed value event: {:?}", e);
+                                        event_errors += 1;
+                                    }
                                 }
                             }
                         }
+                    }
+                    Err(e) => {
+                        eprintln!("[RegistryMonitor] Failed to access registry key {}: {:?}", subkey, e);
+                        scan_successful = false;
+                        consecutive_errors += 1;
+                    }
                 }
+            }
+            
+            // Update error tracking
+            if event_errors > 0 {
+                consecutive_errors += 1;
+            } else if scan_successful {
+                consecutive_errors = 0;
             }
             
             // Send periodic summary
             if last_summary_time.elapsed() > std::time::Duration::from_secs(30) {
                 if changes_detected > 0 {
-                    let _ = sender.send(Event::Registry(format!(
-                        "[RegistryMonitor] Scan #{} - {} registry changes detected",
-                        scan_count, changes_detected
-                    )));
+                    if let Err(e) = sender.send(Event::Registry(format!(
+                        "[RegistryMonitor] Scan #{} - {} registry changes detected ({} event errors)",
+                        scan_count, changes_detected, event_errors
+                    ))) {
+                        eprintln!("[RegistryMonitor] Failed to send summary event: {:?}", e);
+                    }
                 }
                 last_summary_time = std::time::Instant::now();
+            }
+            
+            // Stop if too many consecutive errors
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                eprintln!("[RegistryMonitor] Too many consecutive errors, stopping registry monitoring");
+                let _ = sender.send(Event::Registry("[RegistryMonitor] Stopped due to excessive errors".to_string()));
+                break;
             }
             
             last_values = current_values;
@@ -598,36 +772,50 @@ impl DriverMonitor {
     }
 
     pub fn start_with_sender(&mut self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
-        let _ = sender.send(Event::Driver("[DriverMonitor] Starting driver monitoring...".to_string()));
+        if let Err(e) = sender.send(Event::Driver("[DriverMonitor] Starting driver monitoring...".to_string())) {
+            eprintln!("[DriverMonitor] Failed to send start event: {:?}", e);
+        }
 
         // Get initial drivers using driverquery command
         match Command::new("driverquery").args(&["/FO", "CSV", "/NH"]).output() {
             Ok(output) => {
                 if let Ok(output_str) = String::from_utf8(output.stdout) {
                     let mut driver_count = 0;
+                    let mut event_errors = 0;
+                    
                     for line in output_str.lines().take(20) {
                         if let Some(driver_info) = parse_driverquery_line(line) {
-                            let _ = sender.send(Event::Driver(format!(
+                            if let Err(e) = sender.send(Event::Driver(format!(
                                 "[DriverMonitor] Initial Driver: {} | State: {} | Path: {}",
                                 driver_info.name, driver_info.state, driver_info.path
-                            )));
-                            driver_count += 1;
+                            ))) {
+                                eprintln!("[DriverMonitor] Failed to send driver event: {:?}", e);
+                                event_errors += 1;
+                            } else {
+                                driver_count += 1;
+                            }
                         }
                     }
                     
-                    let _ = sender.send(Event::Driver(format!(
-                        "[DriverMonitor] Found {} active drivers via driverquery",
-                        driver_count
-                    )));
+                    if let Err(e) = sender.send(Event::Driver(format!(
+                        "[DriverMonitor] Found {} active drivers via driverquery ({} event errors)",
+                        driver_count, event_errors
+                    ))) {
+                        eprintln!("[DriverMonitor] Failed to send summary event: {:?}", e);
+                    }
                 } else {
-                    let _ = sender.send(Event::Driver("[DriverMonitor] Error: Failed to parse driverquery output".to_string()));
+                    if let Err(e) = sender.send(Event::Driver("[DriverMonitor] Error: Failed to parse driverquery output".to_string())) {
+                        eprintln!("[DriverMonitor] Failed to send parse error event: {:?}", e);
+                    }
                 }
             }
             Err(e) => {
-                let _ = sender.send(Event::Driver(format!(
+                if let Err(send_err) = sender.send(Event::Driver(format!(
                     "[DriverMonitor] Error: Failed to execute driverquery command: {}",
                     e
-                )));
+                ))) {
+                    eprintln!("[DriverMonitor] Failed to send command error event: {:?}", send_err);
+                }
             }
         }
 
@@ -636,6 +824,8 @@ impl DriverMonitor {
         std::thread::spawn(move || {
             let mut last_drivers = HashMap::new();
             let mut scan_count = 0;
+            let mut consecutive_errors = 0;
+            const MAX_CONSECUTIVE_ERRORS: u32 = 5;
             
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(5));
@@ -650,27 +840,38 @@ impl DriverMonitor {
                                 .map(|info| (info.name.clone(), info.state))
                                 .collect();
                             
+                            let mut event_errors = 0;
+                            
                             // Send periodic scan info for testing
                             if scan_count % 3 == 0 {
-                                let _ = sender_clone.send(Event::Driver(format!(
+                                if let Err(e) = sender_clone.send(Event::Driver(format!(
                                     "[DriverMonitor] Periodic scan #{} - Found {} drivers",
                                     scan_count, current_drivers.len()
-                                )));
+                                ))) {
+                                    eprintln!("[DriverMonitor] Failed to send periodic scan event: {:?}", e);
+                                    event_errors += 1;
+                                }
                             }
                             
                             // Check for new drivers
                             for (name, state) in &current_drivers {
                                 if !last_drivers.contains_key(name) {
-                                    let _ = sender_clone.send(Event::Driver(format!(
+                                    if let Err(e) = sender_clone.send(Event::Driver(format!(
                                         "[DriverMonitor] NEW DRIVER DETECTED: {} | State: {}",
                                         name, state
-                                    )));
+                                    ))) {
+                                        eprintln!("[DriverMonitor] Failed to send new driver event: {:?}", e);
+                                        event_errors += 1;
+                                    }
                                 } else if let Some(old_state) = last_drivers.get(name) {
                                     if old_state != state {
-                                        let _ = sender_clone.send(Event::Driver(format!(
+                                        if let Err(e) = sender_clone.send(Event::Driver(format!(
                                             "[DriverMonitor] Driver changed: {} | Old State: {} | New State: {}",
                                             name, old_state, state
-                                        )));
+                                        ))) {
+                                            eprintln!("[DriverMonitor] Failed to send driver change event: {:?}", e);
+                                            event_errors += 1;
+                                        }
                                     }
                                 }
                             }
@@ -678,21 +879,54 @@ impl DriverMonitor {
                             // Check for removed drivers
                             for (name, _) in &last_drivers {
                                 if !current_drivers.contains_key(name) {
-                                    let _ = sender_clone.send(Event::Driver(format!(
+                                    if let Err(e) = sender_clone.send(Event::Driver(format!(
                                         "[DriverMonitor] DRIVER REMOVED: {}",
                                         name
-                                    )));
+                                    ))) {
+                                        eprintln!("[DriverMonitor] Failed to send driver removed event: {:?}", e);
+                                        event_errors += 1;
+                                    }
                                 }
+                            }
+                            
+                            // Reset error count on successful scan
+                            if event_errors == 0 {
+                                consecutive_errors = 0;
+                            } else {
+                                consecutive_errors += 1;
                             }
                             
                             last_drivers = current_drivers;
                         } else {
+                            consecutive_errors += 1;
                             eprintln!("[DriverMonitor] Error: Failed to parse driverquery output");
+                            
+                            if consecutive_errors <= MAX_CONSECUTIVE_ERRORS {
+                                let _ = sender_clone.send(Event::Driver("[DriverMonitor] Error: Failed to parse driverquery output".to_string()));
+                            }
                         }
                     }
                     Err(e) => {
+                        consecutive_errors += 1;
                         eprintln!("[DriverMonitor] Error: Failed to execute driverquery command: {}", e);
-                        std::thread::sleep(std::time::Duration::from_secs(10)); // Wait longer on error
+                        
+                        if consecutive_errors <= MAX_CONSECUTIVE_ERRORS {
+                            let _ = sender_clone.send(Event::Driver(format!(
+                                "[DriverMonitor] Error: Failed to execute driverquery command: {}",
+                                e
+                            )));
+                        }
+                        
+                        // Exponential backoff on consecutive errors
+                        let backoff_duration = std::time::Duration::from_secs(10 * 2u64.pow(consecutive_errors.min(3)));
+                        std::thread::sleep(backoff_duration);
+                        
+                        // Stop if too many consecutive errors
+                        if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                            eprintln!("[DriverMonitor] Too many consecutive errors, stopping driver monitoring");
+                            let _ = sender_clone.send(Event::Driver("[DriverMonitor] Stopped due to excessive errors".to_string()));
+                            break;
+                        }
                     }
                 }
             }
@@ -707,16 +941,14 @@ impl DriverMonitor {
     }
 }
 
-impl Drop for DriverMonitor {
-    fn drop(&mut self) {
-        let _ = self.stop();
-        println!("[DriverMonitor] DriverMonitor dropped");
-    }
-}
+// Removed Drop implementation to prevent misleading "stopped" messages
+// The actual monitoring happens in a separate thread and continues independently
 
 impl AutostartMonitor {
     pub fn start_with_sender(&self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
-        let _ = sender.send(Event::Autostart("[AutostartMonitor] Starting autostart monitoring...".to_string()));
+        if let Err(e) = sender.send(Event::Autostart("[AutostartMonitor] Starting autostart monitoring...".to_string())) {
+            eprintln!("[AutostartMonitor] Failed to send start event: {:?}", e);
+        }
 
         // Registry locations to check - using proper HKEY conversion
         let registry_locations = vec![
@@ -726,14 +958,31 @@ impl AutostartMonitor {
             (HKEY_CURRENT_USER.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
         ];
 
+        let mut event_errors = 0;
+        
         for (hive, subkey) in registry_locations {
             let key = RegKey::predef(hive);
-            if let Ok(subkey_handle) = key.open_subkey(subkey) {
-                for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
-                    let event_key = format!("autostart_registry_{}_{}", hive, name);
-                    if !should_rate_limit(&event_key, 300) { // Rate limit to 5 minutes
-                        let msg = format!("Registry: {} = {:?}", name, value);
-                        let _ = sender.send(Event::Autostart(msg));
+            match key.open_subkey(subkey) {
+                Ok(subkey_handle) => {
+                    for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
+                        let event_key = format!("autostart_registry_{}_{}", hive, name);
+                        if !should_rate_limit(&event_key, 300) { // Rate limit to 5 minutes
+                            let msg = format!("Registry: {} = {:?}", name, value);
+                            if let Err(e) = sender.send(Event::Autostart(msg)) {
+                                eprintln!("[AutostartMonitor] Failed to send registry autostart event: {:?}", e);
+                                event_errors += 1;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[AutostartMonitor] Failed to access registry key {}: {:?}", subkey, e);
+                    if let Err(send_err) = sender.send(Event::Autostart(format!(
+                        "Registry error: {} - {:?}",
+                        subkey, e
+                    ))) {
+                        eprintln!("[AutostartMonitor] Failed to send registry error event: {:?}", send_err);
+                        event_errors += 1;
                     }
                 }
             }
@@ -746,21 +995,42 @@ impl AutostartMonitor {
         ];
 
         for folder in startup_folders.into_iter().flatten() {
-            if let Ok(entries) = fs::read_dir(folder) {
-                for entry in entries.filter_map(|x| x.ok()) {
-                    let path = entry.path();
-                    if let Some(file_name) = path.file_name() {
-                        let event_key = format!("autostart_folder_{}", file_name.to_string_lossy());
-                        if !should_rate_limit(&event_key, 300) { // Rate limit to 5 minutes
-                            let msg = format!("Startup folder: {}", file_name.to_string_lossy());
-                            let _ = sender.send(Event::Autostart(msg));
+            match fs::read_dir(&folder) {
+                Ok(entries) => {
+                    for entry in entries.filter_map(|x| x.ok()) {
+                        let path = entry.path();
+                        if let Some(file_name) = path.file_name() {
+                            let event_key = format!("autostart_folder_{}", file_name.to_string_lossy());
+                            if !should_rate_limit(&event_key, 300) { // Rate limit to 5 minutes
+                                let msg = format!("Startup folder: {}", file_name.to_string_lossy());
+                                if let Err(e) = sender.send(Event::Autostart(msg)) {
+                                    eprintln!("[AutostartMonitor] Failed to send folder autostart event: {:?}", e);
+                                    event_errors += 1;
+                                }
+                            }
                         }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[AutostartMonitor] Failed to read startup folder {:?}: {:?}", folder, e);
+                    if let Err(send_err) = sender.send(Event::Autostart(format!(
+                        "Folder error: {:?} - {:?}",
+                        folder, e
+                    ))) {
+                        eprintln!("[AutostartMonitor] Failed to send folder error event: {:?}", send_err);
+                        event_errors += 1;
                     }
                 }
             }
         }
 
-        let _ = sender.send(Event::Autostart("Autostart monitoring completed".to_string()));
+        if let Err(e) = sender.send(Event::Autostart(format!(
+            "Autostart monitoring completed ({} event errors)",
+            event_errors
+        ))) {
+            eprintln!("[AutostartMonitor] Failed to send completion event: {:?}", e);
+        }
+        
         Ok(())
     }
 }
@@ -858,6 +1128,8 @@ impl EventLogger {
             const MAX_LOG_SIZE: u64 = 10 * 1024 * 1024; // 10MB
             let mut event_count = 0;
             const ROTATION_CHECK_INTERVAL: usize = 100; // Check every 100 events
+            let mut consecutive_write_errors = 0;
+            const MAX_CONSECUTIVE_WRITE_ERRORS: u32 = 10;
 
             match file {
                 Ok(mut file) => {
@@ -870,31 +1142,71 @@ impl EventLogger {
                                 if metadata.len() > MAX_LOG_SIZE {
                                     // Rotate log file
                                     let backup_path = format!("{}.backup", log_path);
-                                    let _ = std::fs::rename(&log_path, &backup_path);
-                                    
-                                    // Create new log file
-                                    file = match OpenOptions::new()
-                                        .create(true)
-                                        .append(true)
-                                        .open(&log_path) {
-                                        Ok(new_file) => new_file,
-                                        Err(e) => {
-                                            eprintln!("[EventLogger] Failed to create new log file: {}", e);
-                                            continue;
+                                    match std::fs::rename(&log_path, &backup_path) {
+                                        Ok(_) => {
+                                            // Create new log file
+                                            match OpenOptions::new()
+                                                .create(true)
+                                                .append(true)
+                                                .open(&log_path) {
+                                                Ok(new_file) => {
+                                                    file = new_file;
+                                                    
+                                                    // Log rotation event
+                                                    if let Ok(json) = serde_json::to_string(&Event::Registry("[EventLogger] Log file rotated due to size limit".to_string())) {
+                                                        if let Err(e) = writeln!(file, "{}", json) {
+                                                            eprintln!("[EventLogger] Failed to write rotation event: {}", e);
+                                                            consecutive_write_errors += 1;
+                                                        } else {
+                                                            consecutive_write_errors = 0;
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[EventLogger] Failed to create new log file: {}", e);
+                                                    consecutive_write_errors += 1;
+                                                    continue;
+                                                }
+                                            }
                                         }
-                                    };
-                                    
-                                    // Log rotation event
-                                    if let Ok(json) = serde_json::to_string(&Event::Registry("[EventLogger] Log file rotated due to size limit".to_string())) {
-                                        let _ = writeln!(file, "{}", json);
+                                        Err(e) => {
+                                            eprintln!("[EventLogger] Failed to rotate log file: {}", e);
+                                            consecutive_write_errors += 1;
+                                        }
                                     }
                                 }
                             }
                         }
                         
-                        if let Ok(json) = serde_json::to_string(&event) {
-                            if let Err(e) = writeln!(file, "{}", json) {
-                                eprintln!("[EventLogger] Failed to write to log: {}", e);
+                        // Write event to log
+                        match serde_json::to_string(&event) {
+                            Ok(json) => {
+                                if let Err(e) = writeln!(file, "{}", json) {
+                                    eprintln!("[EventLogger] Failed to write to log: {}", e);
+                                    consecutive_write_errors += 1;
+                                    
+                                    // Stop if too many consecutive write errors
+                                    if consecutive_write_errors >= MAX_CONSECUTIVE_WRITE_ERRORS {
+                                        eprintln!("[EventLogger] Too many consecutive write errors, stopping logger");
+                                        break;
+                                    }
+                                } else {
+                                    consecutive_write_errors = 0;
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[EventLogger] Failed to serialize event: {}", e);
+                                consecutive_write_errors += 1;
+                            }
+                        }
+                        
+                        // Flush file periodically to ensure data is written
+                        if event_count % 10 == 0 {
+                            if let Err(e) = file.flush() {
+                                eprintln!("[EventLogger] Failed to flush log file: {}", e);
+                                consecutive_write_errors += 1;
+                            } else {
+                                consecutive_write_errors = 0;
                             }
                         }
                     }

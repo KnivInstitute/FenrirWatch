@@ -9,6 +9,7 @@ selected_event_types:
 - Autostart
 - Service
 - Process
+- Driver
 event_filter: ''
 graph_max_points: 100
 export_format: JSON
