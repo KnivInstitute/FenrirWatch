@@ -16,7 +16,8 @@ widestring = "1.0"
 rand = "0.8"
 uuid = { version = "1.0", features = ["v4"] }
 image = "0.25"
-windows = { version = "0.56", features = ["Win32_System_Diagnostics_Etw", "Win32_System_SystemServices", "Win32_Foundation", "Win32_System_EventLog", "Win32_System_SystemInformation", "Win32_System_Time", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Memory", "Win32_System_Registry", "Win32_Security"] }
+windows = { version = "0.56", features = ["Win32_System_Diagnostics_Etw", "Win32_System_SystemServices", "Win32_Foundation", "Win32_System_EventLog", "Win32_System_SystemInformation", "Win32_System_Time", "Win32_System_Threading", "Win32_System_ProcessStatus", "Win32_System_Memory", "Win32_System_Registry", "Win32_Security", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock", "Win32_NetworkManagement_Ndis", "Win32_System_Diagnostics_ToolHelp"] }
+thiserror = "1.0"
 eframe = "0.26"
 egui = "0.26"
 egui_plot = "0.26"

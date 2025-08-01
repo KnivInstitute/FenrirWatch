@@ -318,29 +318,85 @@ impl FenrirWatchGUI {
             },
             Event::Network(network_event) => {
                 let (icon, color, severity) = match network_event.event_type {
-                    crate::core::NetworkEventType::ConnectionEstablished => ("🔗", egui::Color32::from_rgb(0, 255, 0), EventSeverity::Info),
-                    crate::core::NetworkEventType::ConnectionClosed => ("🔌", egui::Color32::from_rgb(255, 0, 0), EventSeverity::Info),
-                    crate::core::NetworkEventType::DataTransferred => ("📡", egui::Color32::from_rgb(0, 191, 255), EventSeverity::Info),
-                    crate::core::NetworkEventType::ConnectionAttempt => ("🔍", egui::Color32::from_rgb(255, 255, 0), EventSeverity::Warning),
-                    crate::core::NetworkEventType::DNSQuery => ("🌐", egui::Color32::from_rgb(128, 0, 128), EventSeverity::Info),
+                                    crate::core::NetworkEventType::ConnectionEstablished => ("🔗", egui::Color32::from_rgb(0, 255, 0), EventSeverity::Info),
+                crate::core::NetworkEventType::ConnectionClosed => ("🔌", egui::Color32::from_rgb(255, 0, 0), EventSeverity::Info),
+                crate::core::NetworkEventType::DataTransferred => ("📡", egui::Color32::from_rgb(0, 191, 255), EventSeverity::Info),
+                crate::core::NetworkEventType::ConnectionAttempt => ("🔍", egui::Color32::from_rgb(255, 255, 0), EventSeverity::Warning),
+                crate::core::NetworkEventType::DNSQuery => ("🌐", egui::Color32::from_rgb(128, 0, 128), EventSeverity::Info),
+                crate::core::NetworkEventType::SuspiciousConnection => ("⚠️", egui::Color32::from_rgb(255, 165, 0), EventSeverity::Warning),
+                crate::core::NetworkEventType::HighTrafficConnection => ("📊", egui::Color32::from_rgb(255, 20, 147), EventSeverity::Info),
                 };
+                
+                // Create detailed message for network events
+                let mut message_parts = Vec::new();
+                
+                // Add DNS query information if available
+                if let Some(dns_query) = &network_event.dns_query {
+                    message_parts.push(format!("DNS Query: {}", dns_query));
+                    if let Some(dns_response) = &network_event.dns_response {
+                        message_parts.push(format!("-> {}", dns_response));
+                    }
+                } else {
+                    // Regular connection information
+                    message_parts.push(format!("{} {} -> {}", 
+                        network_event.protocol,
+                        network_event.local_address,
+                        network_event.remote_address
+                    ));
+                }
                 
                 let port_info = if let (Some(local_port), Some(remote_port)) = (network_event.local_port, network_event.remote_port) {
                     format!(":{} -> :{}", local_port, remote_port)
                 } else {
+                    format!(":{}", network_event.local_port.unwrap_or(0))
+                };
+                
+                let process_info = if let Some(process_name) = &network_event.process_name {
+                    format!(" [{}:{}]", process_name, network_event.process_pid.unwrap_or(0))
+                } else {
                     String::new()
                 };
                 
-                let data_info = if let (Some(sent), Some(received)) = (network_event.bytes_sent, network_event.bytes_received) {
-                    format!(" ({} sent, {} received)", sent, received)
+                let connection_state = if let Some(state) = &network_event.connection_state {
+                    format!(" [{}]", state)
                 } else {
                     String::new()
+                };
+                
+                let traffic_info = if let (Some(sent), Some(received)) = (network_event.bytes_sent, network_event.bytes_received) {
+                    if sent > 0 || received > 0 {
+                        format!(" (↑{}B ↓{}B)", sent, received)
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    String::new()
+                };
+                
+                let final_message = if message_parts.is_empty() {
+                    format!("{} {} -> {}{}{}{}{}", 
+                        network_event.protocol,
+                        network_event.local_address,
+                        network_event.remote_address,
+                        port_info,
+                        process_info,
+                        connection_state,
+                        traffic_info
+                    )
+                } else {
+                    format!("{}{}{}{}{}", 
+                        message_parts.join(" "),
+                        port_info,
+                        process_info,
+                        connection_state,
+                        traffic_info
+                    )
                 };
                 
                 LogEvent {
                     timestamp,
                     event_type: "Network".to_string(),
-                    message: format!("{} {} {} -> {}{}{}", icon, network_event.protocol, network_event.local_address, network_event.remote_address, port_info, data_info),
+                    message: format!("{} {}", icon, final_message),
                     color,
                     severity,
                 }
@@ -368,12 +424,18 @@ impl FenrirWatchGUI {
         }
         
         // Update event counts
-        match event.event_type.as_str() {
-            "Process" => graph_data.process_events.push(1.0),
-            "Service" => graph_data.service_events.push(1.0),
-            "Registry" => graph_data.registry_events.push(1.0),
-            "Driver" => graph_data.driver_events.push(1.0),
-            _ => {}
+        if event.event_type.contains("Process") {
+            graph_data.process_events.push(1.0);
+        } else if event.event_type.contains("Service") {
+            graph_data.service_events.push(1.0);
+        } else if event.event_type.contains("Registry") {
+            graph_data.registry_events.push(1.0);
+        } else if event.event_type.contains("Driver") {
+            graph_data.driver_events.push(1.0);
+        } else if event.event_type.contains("FileSystem") {
+            graph_data.filesystem_events.push(1.0);
+        } else if event.event_type.contains("Network") {
+            graph_data.network_events.push(1.0);
         }
         
         // Keep only last max_points
@@ -383,6 +445,8 @@ impl FenrirWatchGUI {
             if !graph_data.service_events.is_empty() { graph_data.service_events.remove(0); }
             if !graph_data.registry_events.is_empty() { graph_data.registry_events.remove(0); }
             if !graph_data.driver_events.is_empty() { graph_data.driver_events.remove(0); }
+            if !graph_data.filesystem_events.is_empty() { graph_data.filesystem_events.remove(0); }
+            if !graph_data.network_events.is_empty() { graph_data.network_events.remove(0); }
         }
     }
 
@@ -625,7 +689,7 @@ impl FenrirWatchGUI {
             .show(ui, |ui| {
                 let events = self.events.lock().unwrap();
                 for event in events.iter() {
-                    // Apply filters
+                    // Apply filters  
                     if !self.selected_event_types.contains(&event.event_type) {
                         continue;
                     }

@@ -32,6 +32,9 @@ pub fn request_shutdown() {
 // Windows API imports for registry monitoring
 use windows::{
     Win32::System::Registry::{HKEY_LOCAL_MACHINE, HKEY_CURRENT_USER},
+    Win32::NetworkManagement::IpHelper::*,
+    Win32::Networking::WinSock::*,
+    Win32::Foundation::*,
 };
 
 // Global sender for ETW callback (wrapped in Arc<Mutex> for thread safety)
@@ -121,6 +124,8 @@ pub enum NetworkEventType {
     DataTransferred,
     ConnectionAttempt,
     DNSQuery,
+    SuspiciousConnection,
+    HighTrafficConnection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,7 +140,25 @@ pub struct NetworkEvent {
     pub process_name: Option<String>,
     pub bytes_sent: Option<u64>,
     pub bytes_received: Option<u64>,
+    pub dns_query: Option<String>,
+    pub dns_response: Option<String>,
+    pub connection_state: Option<String>,
     pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NetworkConnectionInfo {
+    pub local_address: String,
+    pub remote_address: String,
+    pub local_port: Option<u16>,
+    pub remote_port: Option<u16>,
+    pub protocol: String,
+    pub process_pid: Option<u32>,
+    pub process_name: Option<String>,
+    pub bytes_sent: Option<u64>,
+    pub bytes_received: Option<u64>,
+    pub connection_state: String,
+    pub creation_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -1395,292 +1418,567 @@ impl NetworkMonitor {
             process_name: Some("NetworkMonitor".to_string()),
             bytes_sent: None,
             bytes_received: None,
+            dns_query: None,
+            dns_response: None,
+            connection_state: Some("LISTENING".to_string()),
             timestamp: Utc::now(),
         })) {
             eprintln!("[NetworkMonitor] Failed to send start event: {:?}", e);
         }
 
-        // Start enhanced network monitoring
-        let sender_clone = sender.clone();
+        // Start comprehensive network monitoring in separate threads
+        let sender_tcp = sender.clone();
+        let sender_udp = sender.clone();
+        let sender_dns = sender.clone();
+        
+        // TCP connection monitoring
         std::thread::spawn(move || {
-            Self::enhanced_network_monitoring(sender_clone);
+            Self::monitor_tcp_connections(sender_tcp);
+        });
+        
+        // UDP connection monitoring  
+        std::thread::spawn(move || {
+            Self::monitor_udp_connections(sender_udp);
+        });
+        
+        // DNS query monitoring
+        std::thread::spawn(move || {
+            Self::monitor_dns_queries(sender_dns);
         });
 
         Ok(())
     }
 
-    fn enhanced_network_monitoring(sender: Sender<Event>) {
+    // TCP Connection Monitoring using Windows IpHelper APIs
+    fn monitor_tcp_connections(sender: Sender<Event>) {
         let mut last_connections: HashMap<String, NetworkConnectionInfo> = HashMap::new();
-        let mut scan_count = 0;
-        let mut last_summary_time = std::time::Instant::now();
+        let mut _scan_count = 0;
         let mut consecutive_errors = 0;
         const MAX_CONSECUTIVE_ERRORS: u32 = 10;
         
-        // Suspicious IP ranges and domains
+        println!("[NetworkMonitor] Starting TCP connection monitoring...");
+        
+        // Suspicious IP ranges for security analysis
         let suspicious_ips = vec![
-            "192.168.1.1", // Example - would be replaced with actual suspicious IPs
-            "10.0.0.1",
+            "0.0.0.0", "127.0.0.1", "169.254.", "224.", "239.", "255.255.255.255"
         ];
+        let suspicious_ports = vec![4444, 1337, 31337, 6666, 6667]; // Common malware ports
         
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(3)); // Network monitoring interval
-            scan_count += 1;
+            if is_shutdown() { break; }
             
-            match Self::get_network_connections() {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            _scan_count += 1;
+            
+            match Self::get_tcp_connections() {
                 Ok(current_connections) => {
-                    let mut changes_detected = 0;
-                    let mut event_errors = 0;
+                    consecutive_errors = 0;
                     
-                    // Check for new connections
+                    // Detect new connections
                     for (conn_id, conn_info) in &current_connections {
                         if !last_connections.contains_key(conn_id) {
-                            changes_detected += 1;
-                            let event_key = format!("network_new_{}", conn_id);
-                            if !should_rate_limit(&event_key, 30) { // Rate limit to 30 seconds
-                                let severity = if Self::is_suspicious_connection(&conn_info, &suspicious_ips) {
-                                    NetworkEventType::ConnectionEstablished
+                            // New TCP connection detected
+                            
+                            let event_key = format!("tcp_new_{}", conn_id);
+                            if !should_rate_limit(&event_key, 2) {
+                                let event_type = if Self::is_suspicious_tcp_connection(&conn_info, &suspicious_ips, &suspicious_ports) {
+                                    NetworkEventType::SuspiciousConnection
                                 } else {
                                     NetworkEventType::ConnectionEstablished
                                 };
                                 
-                                if let Err(e) = sender.send(Event::Network(NetworkEvent {
-                                    event_type: severity,
-                                    local_address: conn_info.local_address.clone(),
-                                    remote_address: conn_info.remote_address.clone(),
-                                    local_port: conn_info.local_port,
-                                    remote_port: conn_info.remote_port,
-                                    protocol: conn_info.protocol.clone(),
-                                    process_pid: conn_info.process_pid,
-                                    process_name: conn_info.process_name.clone(),
-                                    bytes_sent: conn_info.bytes_sent,
-                                    bytes_received: conn_info.bytes_received,
-                                    timestamp: Utc::now(),
-                                })) {
-                                    eprintln!("[NetworkMonitor] Failed to send new connection event: {:?}", e);
-                                    event_errors += 1;
-                                }
+                                Self::send_network_event(&sender, event_type, conn_info, None, None);
                             }
                         } else if let Some(old_conn) = last_connections.get(conn_id) {
-                            // Check for data transfer changes
-                            let data_changed = old_conn.bytes_sent != conn_info.bytes_sent || 
-                                            old_conn.bytes_received != conn_info.bytes_received;
-                            
-                            if data_changed {
-                                changes_detected += 1;
-                                let event_key = format!("network_data_{}", conn_id);
-                                if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
-                                    if let Err(e) = sender.send(Event::Network(NetworkEvent {
-                                        event_type: NetworkEventType::DataTransferred,
-                                        local_address: conn_info.local_address.clone(),
-                                        remote_address: conn_info.remote_address.clone(),
-                                        local_port: conn_info.local_port,
-                                        remote_port: conn_info.remote_port,
-                                        protocol: conn_info.protocol.clone(),
-                                        process_pid: conn_info.process_pid,
-                                        process_name: conn_info.process_name.clone(),
-                                        bytes_sent: conn_info.bytes_sent,
-                                        bytes_received: conn_info.bytes_received,
-                                        timestamp: Utc::now(),
-                                    })) {
-                                        eprintln!("[NetworkMonitor] Failed to send data transfer event: {:?}", e);
-                                        event_errors += 1;
-                                    }
+                            // Check for data transfer
+                            let traffic_delta = Self::calculate_traffic_delta(old_conn, conn_info);
+                            if traffic_delta > 1024 * 1024 { // More than 1MB transferred
+                                let event_key = format!("tcp_traffic_{}", conn_id);
+                                if !should_rate_limit(&event_key, 5) {
+                                    Self::send_network_event(&sender, NetworkEventType::HighTrafficConnection, 
+                                                           conn_info, None, None);
                                 }
                             }
                         }
                     }
                     
-                    // Check for closed connections
+                    // Detect closed connections
                     for (conn_id, old_conn) in &last_connections {
                         if !current_connections.contains_key(conn_id) {
-                            changes_detected += 1;
-                            let event_key = format!("network_closed_{}", conn_id);
-                            if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
-                                if let Err(e) = sender.send(Event::Network(NetworkEvent {
-                                    event_type: NetworkEventType::ConnectionClosed,
-                                    local_address: old_conn.local_address.clone(),
-                                    remote_address: old_conn.remote_address.clone(),
-                                    local_port: old_conn.local_port,
-                                    remote_port: old_conn.remote_port,
-                                    protocol: old_conn.protocol.clone(),
-                                    process_pid: old_conn.process_pid,
-                                    process_name: old_conn.process_name.clone(),
-                                    bytes_sent: old_conn.bytes_sent,
-                                    bytes_received: old_conn.bytes_received,
-                                    timestamp: Utc::now(),
-                                })) {
-                                    eprintln!("[NetworkMonitor] Failed to send connection closed event: {:?}", e);
-                                    event_errors += 1;
-                                }
+                            // TCP connection closed
+                            
+                            let event_key = format!("tcp_closed_{}", conn_id);
+                            if !should_rate_limit(&event_key, 5) {
+                                Self::send_network_event(&sender, NetworkEventType::ConnectionClosed, 
+                                                       old_conn, None, None);
                             }
                         }
-                    }
-                    
-                    // Reset error count on successful scan
-                    if event_errors == 0 {
-                        consecutive_errors = 0;
-                    } else {
-                        consecutive_errors += 1;
-                    }
-                    
-                    // Send periodic summary
-                    if last_summary_time.elapsed() > std::time::Duration::from_secs(30) {
-                        if changes_detected > 0 {
-                            if let Err(e) = sender.send(Event::Network(NetworkEvent {
-                                event_type: NetworkEventType::ConnectionEstablished,
-                                local_address: format!("[NetworkMonitor] Scan #{} - {} network changes detected ({} event errors)",
-                                                     scan_count, changes_detected, event_errors),
-                                remote_address: "localhost".to_string(),
-                                local_port: None,
-                                remote_port: None,
-                                protocol: "TCP".to_string(),
-                                process_pid: None,
-                                process_name: Some("NetworkMonitor".to_string()),
-                                bytes_sent: None,
-                                bytes_received: None,
-                                timestamp: Utc::now(),
-                            })) {
-                                eprintln!("[NetworkMonitor] Failed to send summary event: {:?}", e);
-                            }
-                        }
-                        last_summary_time = std::time::Instant::now();
                     }
                     
                     last_connections = current_connections;
                 }
                 Err(e) => {
-                    consecutive_errors += 1;
-                    eprintln!("[NetworkMonitor] Error getting network connections: {}", e);
+                        consecutive_errors += 1;
+                    eprintln!("[NetworkMonitor] TCP monitoring error: {}", e);
                     
-                    if consecutive_errors <= MAX_CONSECUTIVE_ERRORS {
-                        let _ = sender.send(Event::Network(NetworkEvent {
-                            event_type: NetworkEventType::ConnectionAttempt,
-                            local_address: format!("[NetworkMonitor] Error: {}", e),
-                            remote_address: "localhost".to_string(),
-                            local_port: None,
-                            remote_port: None,
-                            protocol: "TCP".to_string(),
-                            process_pid: None,
-                            process_name: Some("NetworkMonitor".to_string()),
-                            bytes_sent: None,
-                            bytes_received: None,
-                            timestamp: Utc::now(),
-                        }));
-                    }
-                    
-                    // Exponential backoff on consecutive errors
-                    let backoff_duration = std::time::Duration::from_secs(10 * 2u64.pow(consecutive_errors.min(3)));
-                    std::thread::sleep(backoff_duration);
-                    
-                    // Stop if too many consecutive errors
                     if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
-                        eprintln!("[NetworkMonitor] Too many consecutive errors, stopping network monitoring");
-                        let _ = sender.send(Event::Network(NetworkEvent {
-                            event_type: NetworkEventType::ConnectionClosed,
-                            local_address: "[NetworkMonitor] Stopped due to excessive errors".to_string(),
-                            remote_address: "localhost".to_string(),
-                            local_port: None,
-                            remote_port: None,
-                            protocol: "TCP".to_string(),
-                            process_pid: None,
-                            process_name: Some("NetworkMonitor".to_string()),
-                            bytes_sent: None,
-                            bytes_received: None,
-                            timestamp: Utc::now(),
-                        }));
+                        eprintln!("[NetworkMonitor] Too many TCP monitoring errors, stopping");
                         break;
                     }
+                    
+                    std::thread::sleep(std::time::Duration::from_secs(5));
                 }
             }
         }
     }
-
-    fn get_network_connections() -> Result<HashMap<String, NetworkConnectionInfo>, Box<dyn Error>> {
+    
+    // UDP Connection Monitoring
+    fn monitor_udp_connections(sender: Sender<Event>) {        
+        loop {
+            if is_shutdown() { break; }
+            
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            
+            match Self::get_udp_connections() {
+                Ok(connections) => {
+                    for (_conn_id, conn_info) in connections {
+                        // UDP connections are often short-lived, focus on suspicious ones
+                        if Self::is_suspicious_udp_connection(&conn_info) {
+                            let event_key = format!("udp_suspicious_{}_{}", 
+                                                   conn_info.local_address, 
+                                                   conn_info.local_port.unwrap_or(0));
+                            if !should_rate_limit(&event_key, 10) {
+                                Self::send_network_event(&sender, NetworkEventType::SuspiciousConnection, 
+                                                       &conn_info, None, None);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("[NetworkMonitor] UDP monitoring error: {}", e);
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+            }
+        }
+    }
+    
+    // DNS Query Monitoring using netstat and system calls
+    fn monitor_dns_queries(sender: Sender<Event>) {
+        let mut last_dns_cache: HashMap<String, DateTime<Utc>> = HashMap::new();
+        
+        loop {
+            if is_shutdown() { break; }
+            
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            
+            // Monitor DNS cache for new entries
+            match Self::get_dns_cache_entries() {
+                Ok(dns_entries) => {
+                    for entry in dns_entries {
+                        let cache_key = format!("{}_{}", entry.0, entry.1);
+                        if !last_dns_cache.contains_key(&cache_key) {
+                            
+                            let event_key = format!("dns_query_{}", entry.0);
+                            if !should_rate_limit(&event_key, 3) {
+                                Self::send_dns_event(&sender, &entry.0, &entry.1);
+                            }
+                            last_dns_cache.insert(cache_key, Utc::now());
+                        }
+                    }
+                    
+                    // Clean old entries
+                    let now = Utc::now();
+                    last_dns_cache.retain(|_, time| {
+                        now.signed_duration_since(*time).num_minutes() < 60
+                    });
+                }
+                Err(_) => {
+                    // DNS monitoring error, wait before retry
+                    std::thread::sleep(std::time::Duration::from_secs(10));
+                }
+            }
+        }
+    }
+    
+    // Get TCP connections using Windows APIs
+    fn get_tcp_connections() -> Result<HashMap<String, NetworkConnectionInfo>, Box<dyn Error>> {
         let mut connections = HashMap::new();
         
-        // Use netstat command to get network connections
-        match Command::new("netstat").args(&["-an", "-p", "TCP"]).output() {
-            Ok(output) => {
-                if let Ok(output_str) = String::from_utf8(output.stdout) {
-                    for line in output_str.lines().skip(4) { // Skip header lines
-                        if let Some(conn_info) = Self::parse_netstat_line(line) {
-                            let conn_id = format!("{}_{}_{}_{}", 
-                                conn_info.local_address, conn_info.local_port.unwrap_or(0),
-                                conn_info.remote_address, conn_info.remote_port.unwrap_or(0));
+        unsafe {
+            let mut table_size = 0u32;
+            let mut tcp_table: *mut MIB_TCPTABLE_OWNER_PID = std::ptr::null_mut();
+            
+            // Get table size
+            let result = GetExtendedTcpTable(
+                None,
+                &mut table_size,
+                false,
+                AF_INET.0 as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            
+            if result == ERROR_INSUFFICIENT_BUFFER.0 {
+                // Allocate buffer
+                let layout = std::alloc::Layout::from_size_align(table_size as usize, 8)
+                    .map_err(|e| format!("Layout error: {}", e))?;
+                tcp_table = std::alloc::alloc(layout) as *mut MIB_TCPTABLE_OWNER_PID;
+                
+                if tcp_table.is_null() {
+                    return Err("Failed to allocate memory for TCP table".into());
+                }
+                
+                // Get actual table
+                let result = GetExtendedTcpTable(
+                    Some(tcp_table as *mut std::ffi::c_void),
+                    &mut table_size,
+                    false,
+                    AF_INET.0 as u32,
+                    TCP_TABLE_OWNER_PID_ALL,
+                    0,
+                );
+                
+                if result == NO_ERROR.0 {
+                    let table = &*tcp_table;
+                    let entries = std::slice::from_raw_parts(
+                        &table.table[0],
+                        table.dwNumEntries as usize,
+                    );
+                    
+                    for entry in entries {
+                        // Monitor all active connection states (not just ESTABLISHED)
+                        if entry.dwState == MIB_TCP_STATE_ESTAB.0 as u32 || 
+                           entry.dwState == MIB_TCP_STATE_SYN_SENT.0 as u32 ||
+                           entry.dwState == MIB_TCP_STATE_SYN_RCVD.0 as u32 ||
+                           entry.dwState == MIB_TCP_STATE_FIN_WAIT1.0 as u32 ||
+                           entry.dwState == MIB_TCP_STATE_FIN_WAIT2.0 as u32 ||
+                           entry.dwState == MIB_TCP_STATE_CLOSE_WAIT.0 as u32 ||
+                           entry.dwState == MIB_TCP_STATE_CLOSING.0 as u32 ||
+                           entry.dwState == MIB_TCP_STATE_LAST_ACK.0 as u32 ||
+                           entry.dwState == MIB_TCP_STATE_TIME_WAIT.0 as u32 {
+                            
+                            let local_addr = format!("{}.{}.{}.{}",
+                                (entry.dwLocalAddr) & 0xFF,
+                                (entry.dwLocalAddr >> 8) & 0xFF,
+                                (entry.dwLocalAddr >> 16) & 0xFF,
+                                (entry.dwLocalAddr >> 24) & 0xFF,
+                            );
+                            
+                            let remote_addr = if entry.dwRemoteAddr != 0 {
+                                format!("{}.{}.{}.{}",
+                                    (entry.dwRemoteAddr) & 0xFF,
+                                    (entry.dwRemoteAddr >> 8) & 0xFF,
+                                    (entry.dwRemoteAddr >> 16) & 0xFF,
+                                    (entry.dwRemoteAddr >> 24) & 0xFF,
+                                )
+                            } else {
+                                "0.0.0.0".to_string()
+                            };
+                            
+                            let local_port = ((entry.dwLocalPort >> 8) & 0xFF) as u16 | 
+                                           ((entry.dwLocalPort & 0xFF) << 8) as u16;
+                            let remote_port = if entry.dwRemotePort != 0 {
+                                Some(((entry.dwRemotePort >> 8) & 0xFF) as u16 | 
+                                     ((entry.dwRemotePort & 0xFF) << 8) as u16)
+                            } else {
+                                None
+                            };
+                            
+                            let process_name = Self::get_process_name(entry.dwOwningPid);
+                            
+                            let conn_info = NetworkConnectionInfo {
+                                local_address: local_addr.clone(),
+                                remote_address: remote_addr.clone(),
+                                local_port: Some(local_port),
+                                remote_port,
+                            protocol: "TCP".to_string(),
+                                process_pid: Some(entry.dwOwningPid),
+                                process_name,
+                            bytes_sent: None,
+                            bytes_received: None,
+                                connection_state: Self::tcp_state_to_string(entry.dwState),
+                                creation_time: Utc::now(),
+                            };
+                            
+                            let conn_id = format!("{}:{}->{}:{}", 
+                                local_addr, local_port, remote_addr, remote_port.unwrap_or(0));
                             connections.insert(conn_id, conn_info);
                         }
                     }
                 }
-            }
-            Err(e) => {
-                eprintln!("[NetworkMonitor] Error running netstat: {}", e);
-                return Err(Box::new(e));
+                
+                std::alloc::dealloc(tcp_table as *mut u8, layout);
             }
         }
         
         Ok(connections)
     }
-
-    fn parse_netstat_line(line: &str) -> Option<NetworkConnectionInfo> {
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 4 {
-            let protocol = parts[0].to_string();
-            let local_addr = parts[1].to_string();
-            let remote_addr = parts[2].to_string();
-            let state = parts[3].to_string();
+    
+    // Get UDP connections using Windows APIs
+    fn get_udp_connections() -> Result<HashMap<String, NetworkConnectionInfo>, Box<dyn Error>> {
+        let mut connections = HashMap::new();
+        
+        unsafe {
+            let mut table_size = 0u32;
+            let mut udp_table: *mut MIB_UDPTABLE_OWNER_PID = std::ptr::null_mut();
             
-            // Parse local address and port
-            let (local_ip, local_port) = Self::parse_address(&local_addr);
-            let (remote_ip, remote_port) = Self::parse_address(&remote_addr);
+            let result = GetExtendedUdpTable(
+                None,
+                &mut table_size,
+                false,
+                AF_INET.0 as u32,
+                UDP_TABLE_OWNER_PID,
+                0,
+            );
             
-            // Only include established connections
-            if state == "ESTABLISHED" {
-                return Some(NetworkConnectionInfo {
-                    local_address: local_ip,
-                    remote_address: remote_ip,
-                    local_port: local_port,
-                    remote_port: remote_port,
-                    protocol,
-                    process_pid: None, // Will be enhanced with process tracking
-                    process_name: None,
-                    bytes_sent: None, // Will be enhanced with data tracking
-                    bytes_received: None,
-                });
+            if result == ERROR_INSUFFICIENT_BUFFER.0 {
+                let layout = std::alloc::Layout::from_size_align(table_size as usize, 8)
+                    .map_err(|e| format!("Layout error: {}", e))?;
+                udp_table = std::alloc::alloc(layout) as *mut MIB_UDPTABLE_OWNER_PID;
+                
+                if !udp_table.is_null() {
+                    let result = GetExtendedUdpTable(
+                        Some(udp_table as *mut std::ffi::c_void),
+                        &mut table_size,
+                        false,
+                        AF_INET.0 as u32,
+                        UDP_TABLE_OWNER_PID,
+                        0,
+                    );
+                    
+                    if result == NO_ERROR.0 {
+                        let table = &*udp_table;
+                        let entries = std::slice::from_raw_parts(
+                            &table.table[0],
+                            table.dwNumEntries as usize,
+                        );
+                        
+                        for entry in entries {
+                            let local_addr = format!("{}.{}.{}.{}",
+                                (entry.dwLocalAddr) & 0xFF,
+                                (entry.dwLocalAddr >> 8) & 0xFF,
+                                (entry.dwLocalAddr >> 16) & 0xFF,
+                                (entry.dwLocalAddr >> 24) & 0xFF,
+                            );
+                            
+                            let local_port = ((entry.dwLocalPort >> 8) & 0xFF) as u16 | 
+                                           ((entry.dwLocalPort & 0xFF) << 8) as u16;
+                            
+                            let process_name = Self::get_process_name(entry.dwOwningPid);
+                            
+                            let conn_info = NetworkConnectionInfo {
+                                local_address: local_addr.clone(),
+                                remote_address: "0.0.0.0".to_string(),
+                                local_port: Some(local_port),
+                            remote_port: None,
+                                protocol: "UDP".to_string(),
+                                process_pid: Some(entry.dwOwningPid),
+                                process_name,
+                            bytes_sent: None,
+                            bytes_received: None,
+                                connection_state: "LISTENING".to_string(),
+                                creation_time: Utc::now(),
+                            };
+                            
+                            let conn_id = format!("UDP_{}:{}", local_addr, local_port);
+                            connections.insert(conn_id, conn_info);
+                        }
+                    }
+                    
+                    std::alloc::dealloc(udp_table as *mut u8, layout);
+                }
             }
+        }
+        
+        Ok(connections)
+    }
+    
+    // Get DNS cache entries by parsing system commands and netstat
+    fn get_dns_cache_entries() -> Result<Vec<(String, String)>, Box<dyn Error>> {
+        let mut entries = Vec::new();
+        
+        // Method 1: DNS Cache
+        match Command::new("ipconfig").args(&["/displaydns"]).output() {
+            Ok(output) => {
+                if let Ok(output_str) = String::from_utf8(output.stdout) {
+                    let mut current_record_name = String::new();
+                    
+                    for line in output_str.lines() {
+                        let line = line.trim();
+                        
+                        if line.starts_with("Record Name") {
+                            if let Some(colon_pos) = line.find(':') {
+                                current_record_name = line[colon_pos + 1..].trim().to_string();
+                            }
+                        } else if line.starts_with("A (Host) Record") && !current_record_name.is_empty() {
+                            continue;
+                        } else if line.starts_with("Name does not exist") && !current_record_name.is_empty() {
+                            entries.push((current_record_name.clone(), "NXDOMAIN".to_string()));
+                            current_record_name.clear();
+                        } else if !current_record_name.is_empty() && Self::is_ip_address(line) {
+                            entries.push((current_record_name.clone(), line.to_string()));
+                            current_record_name.clear();
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                // DNS cache lookup failed, silently continue
+            }
+        }
+        
+        // Method 2: Look for connections to DNS servers (port 53)
+        match Command::new("netstat").args(&["-an"]).output() {
+            Ok(output) => {
+                if let Ok(output_str) = String::from_utf8(output.stdout) {
+                    for line in output_str.lines() {
+                        if line.contains(":53 ") && line.contains("UDP") {
+                            let parts: Vec<&str> = line.split_whitespace().collect();
+                            if parts.len() >= 3 {
+                                let remote_addr = parts[2];
+                                if remote_addr.contains(":53") {
+                                    entries.push(("DNS_SERVER_CONNECTION".to_string(), remote_addr.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
+        }
+        
+        Ok(entries)
+    }
+    
+    // Helper functions
+    fn get_process_name(pid: u32) -> Option<String> {
+        match Command::new("tasklist")
+            .args(&["/FI", &format!("PID eq {}", pid), "/FO", "CSV", "/NH"])
+            .output()
+        {
+            Ok(output) => {
+                if let Ok(output_str) = String::from_utf8(output.stdout) {
+                    if let Some(first_line) = output_str.lines().next() {
+                        let parts: Vec<&str> = first_line.split(',').collect();
+                        if parts.len() > 0 {
+                            return Some(parts[0].trim_matches('"').to_string());
+                        }
+                    }
+                }
+            }
+            Err(_) => {}
         }
         None
     }
-
-    fn parse_address(addr: &str) -> (String, Option<u16>) {
-        if let Some(colon_pos) = addr.rfind(':') {
-            let ip = addr[..colon_pos].to_string();
-            let port_str = &addr[colon_pos + 1..];
-            if let Ok(port) = port_str.parse::<u16>() {
-                return (ip, Some(port));
+    
+    fn tcp_state_to_string(state: u32) -> String {
+        match state {
+            1 => "CLOSED".to_string(),
+            2 => "LISTEN".to_string(),
+            3 => "SYN_SENT".to_string(),
+            4 => "SYN_RCVD".to_string(),
+            5 => "ESTABLISHED".to_string(),
+            6 => "FIN_WAIT1".to_string(),
+            7 => "FIN_WAIT2".to_string(),
+            8 => "CLOSE_WAIT".to_string(),
+            9 => "CLOSING".to_string(),
+            10 => "LAST_ACK".to_string(),
+            11 => "TIME_WAIT".to_string(),
+            12 => "DELETE_TCB".to_string(),
+            _ => format!("UNKNOWN({})", state),
+        }
+    }
+    
+    fn is_ip_address(s: &str) -> bool {
+        s.split('.').count() == 4 && 
+        s.split('.').all(|part| part.parse::<u8>().is_ok())
+    }
+    
+    fn is_suspicious_tcp_connection(conn: &NetworkConnectionInfo, _suspicious_ips: &[&str], suspicious_ports: &[u16]) -> bool {
+        // Check for suspicious ports
+        if let Some(port) = conn.remote_port {
+            if suspicious_ports.contains(&port) {
+                return true;
             }
         }
-        (addr.to_string(), None)
+        
+        // Mark connections to interesting web services for visibility 
+        if let Some(port) = conn.remote_port {
+            match port {
+                80 | 443 | 8080 | 8443 => {
+                    // Always show web traffic
+                    return false; // Not suspicious, but important to show
+                }
+                _ => {}
+            }
+        }
+        
+        false
     }
-
-    fn is_suspicious_connection(conn_info: &NetworkConnectionInfo, suspicious_ips: &[&str]) -> bool {
-        suspicious_ips.iter().any(|ip| {
-            conn_info.remote_address.contains(ip) || conn_info.local_address.contains(ip)
-        })
+    
+    fn is_suspicious_udp_connection(conn: &NetworkConnectionInfo) -> bool {
+        if let Some(port) = conn.local_port {
+            // Check for common malware UDP ports
+            match port {
+                69 | 135 | 445 | 1434 | 4444 | 6666 => true,
+                _ => false,
+            }
+        } else {
+            false
+        }
+    }
+    
+    fn calculate_traffic_delta(old: &NetworkConnectionInfo, new: &NetworkConnectionInfo) -> u64 {
+        let old_sent = old.bytes_sent.unwrap_or(0);
+        let old_recv = old.bytes_received.unwrap_or(0);
+        let new_sent = new.bytes_sent.unwrap_or(0);
+        let new_recv = new.bytes_received.unwrap_or(0);
+        
+        (new_sent.saturating_sub(old_sent)) + (new_recv.saturating_sub(old_recv))
+    }
+    
+    fn send_network_event(sender: &Sender<Event>, event_type: NetworkEventType, 
+                         conn: &NetworkConnectionInfo, dns_query: Option<String>, 
+                         dns_response: Option<String>) {
+        let _ = sender.send(Event::Network(NetworkEvent {
+            event_type,
+            local_address: conn.local_address.clone(),
+            remote_address: conn.remote_address.clone(),
+            local_port: conn.local_port,
+            remote_port: conn.remote_port,
+            protocol: conn.protocol.clone(),
+            process_pid: conn.process_pid,
+            process_name: conn.process_name.clone(),
+            bytes_sent: conn.bytes_sent,
+            bytes_received: conn.bytes_received,
+            dns_query,
+            dns_response,
+            connection_state: Some(conn.connection_state.clone()),
+            timestamp: Utc::now(),
+        }));
+    }
+    
+    fn send_dns_event(sender: &Sender<Event>, query: &str, response: &str) {
+        let _ = sender.send(Event::Network(NetworkEvent {
+            event_type: NetworkEventType::DNSQuery,
+            local_address: "DNS_RESOLVER".to_string(),
+            remote_address: response.to_string(),
+            local_port: Some(53),
+            remote_port: Some(53),
+            protocol: "DNS".to_string(),
+            process_pid: None,
+            process_name: Some("System".to_string()),
+            bytes_sent: None,
+            bytes_received: None,
+            dns_query: Some(query.to_string()),
+            dns_response: Some(response.to_string()),
+            connection_state: Some("RESOLVED".to_string()),
+            timestamp: Utc::now(),
+        }));
     }
 }
 
-#[derive(Debug, Clone)]
-struct NetworkConnectionInfo {
-    local_address: String,
-    remote_address: String,
-    local_port: Option<u16>,
-    remote_port: Option<u16>,
-    protocol: String,
-    process_pid: Option<u32>,
-    process_name: Option<String>,
-    bytes_sent: Option<u64>,
-    bytes_received: Option<u64>,
-}
+
 
 // Helper struct for parsing tasklist output
 struct ProcessInfo {
