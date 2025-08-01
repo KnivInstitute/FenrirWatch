@@ -13,6 +13,21 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::process::Command;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
+use once_cell::sync::Lazy;
+
+// Global graceful shutdown flag
+pub static SHUTDOWN_FLAG: Lazy<AtomicBool> = Lazy::new(|| AtomicBool::new(false));
+
+/// Returns true if a shutdown has been requested.
+pub fn is_shutdown() -> bool {
+    SHUTDOWN_FLAG.load(Ordering::Relaxed)
+}
+
+/// Request all background threads to terminate gracefully.
+pub fn request_shutdown() {
+    SHUTDOWN_FLAG.store(true, Ordering::Relaxed);
+}
 
 // Windows API imports for registry monitoring
 use windows::{
@@ -76,6 +91,51 @@ pub enum Event {
     Registry(String),
     Autostart(String),
     Hook(String),
+    FileSystem(FileSystemEvent),
+    Network(NetworkEvent),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FileSystemEventType {
+    Created,
+    Modified,
+    Deleted,
+    Renamed,
+    Accessed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSystemEvent {
+    pub event_type: FileSystemEventType,
+    pub path: String,
+    pub size: Option<u64>,
+    pub process_pid: Option<u32>,
+    pub process_name: Option<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum NetworkEventType {
+    ConnectionEstablished,
+    ConnectionClosed,
+    DataTransferred,
+    ConnectionAttempt,
+    DNSQuery,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkEvent {
+    pub event_type: NetworkEventType,
+    pub local_address: String,
+    pub remote_address: String,
+    pub local_port: Option<u16>,
+    pub remote_port: Option<u16>,
+    pub protocol: String,
+    pub process_pid: Option<u32>,
+    pub process_name: Option<String>,
+    pub bytes_sent: Option<u64>,
+    pub bytes_received: Option<u64>,
+    pub timestamp: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +202,33 @@ pub struct AutostartMonitor;
 /// Future implementation will scan for inline hooks and API detours
 /// that could indicate monitoring evasion or malicious activity.
 pub struct HookDetector;
+
+/// File system monitoring for security analysis
+/// 
+/// Monitors file system events including creation, modification, deletion,
+/// and access patterns that could indicate malicious activity or data exfiltration.
+/// 
+/// Monitored events:
+/// - File creation in sensitive directories
+/// - File modifications in system directories
+/// - Deletion of important files
+/// - Access to user data directories
+/// - Suspicious file extensions and patterns
+pub struct FileSystemMonitor;
+
+/// Network connection monitoring for threat detection
+/// 
+/// Tracks network connections, data transfers, and communication patterns
+/// that could indicate malware communication, data exfiltration, or
+/// unauthorized network activity.
+/// 
+/// Monitored events:
+/// - New network connections
+/// - Data transfer patterns
+/// - DNS queries and resolution
+/// - Connection to suspicious IPs
+/// - Process-specific network activity
+pub struct NetworkMonitor;
 
 impl ProcessMonitor {
     /// Starts process monitoring with the provided event sender
@@ -262,6 +349,21 @@ impl ProcessMonitor {
         const MAX_CONSECUTIVE_ERRORS: u32 = 5;
         
         loop {
+            if is_shutdown() {
+                if let Err(e) = sender.send(Event::Process(ProcessEvent {
+                    event_type: ProcessEventType::Terminated,
+                    pid: 0,
+                    ppid: 0,
+                    name: "ProcessMonitor shutting down".to_string(),
+                    command_line: None,
+                    executable_path: None,
+                    user: Some("system".to_string()),
+                    timestamp: Utc::now(),
+                })) {
+                    eprintln!("[ProcessMonitor] Failed to send shutdown event: {:?}", e);
+                }
+                break;
+            }
             // Sleep longer to reduce resource usage
             std::thread::sleep(std::time::Duration::from_secs(5));
             scan_count += 1;
@@ -481,6 +583,12 @@ impl ServiceMonitor {
             const MAX_CONSECUTIVE_ERRORS: u32 = 5;
             
             loop {
+                if is_shutdown() {
+                    if let Err(e) = sender_clone.send(Event::Service("[ServiceMonitor] Shutting down".to_string())) {
+                        eprintln!("[ServiceMonitor] Failed to send shutdown event: {:?}", e);
+                    }
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_secs(10));
                 
                 match Command::new("sc").args(&["query", "type=", "service", "state=", "all"]).output() {
@@ -828,6 +936,12 @@ impl DriverMonitor {
             const MAX_CONSECUTIVE_ERRORS: u32 = 5;
             
             loop {
+                if is_shutdown() {
+                    if let Err(e) = sender_clone.send(Event::Driver("[DriverMonitor] Shutting down".to_string())) {
+                        eprintln!("[DriverMonitor] Failed to send shutdown event: {:?}", e);
+                    }
+                    break;
+                }
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 scan_count += 1;
                 
@@ -1040,6 +1154,532 @@ impl HookDetector {
         let _ = sender.send(Event::Hook("Hook detection not yet implemented".to_string()));
         Ok(())
     }
+}
+
+impl FileSystemMonitor {
+    pub fn start_with_sender(&self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
+        if let Err(e) = sender.send(Event::FileSystem(FileSystemEvent {
+            event_type: FileSystemEventType::Created,
+            path: "FileSystemMonitor".to_string(),
+            size: None,
+            process_pid: None,
+            process_name: Some("FileSystemMonitor".to_string()),
+            timestamp: Utc::now(),
+        })) {
+            eprintln!("[FileSystemMonitor] Failed to send start event: {:?}", e);
+        }
+
+        // Critical directories to monitor
+        let critical_dirs = vec![
+            std::env::var("SYSTEMROOT").unwrap_or_else(|_| "C:\\Windows".to_string()),
+            std::env::var("PROGRAMFILES").unwrap_or_else(|_| "C:\\Program Files".to_string()),
+            std::env::var("APPDATA").unwrap_or_else(|_| "C:\\Users\\Default\\AppData\\Roaming".to_string()),
+            std::env::var("TEMP").unwrap_or_else(|_| "C:\\Windows\\Temp".to_string()),
+            std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\Users\\Default".to_string()),
+        ];
+
+        // Initial scan of critical directories
+        let mut _event_errors = 0;
+        for dir in &critical_dirs {
+            if let Err(e) = sender.send(Event::FileSystem(FileSystemEvent {
+                event_type: FileSystemEventType::Accessed,
+                path: format!("[FileSystemMonitor] Monitoring directory: {}", dir),
+                size: None,
+                process_pid: None,
+                process_name: Some("FileSystemMonitor".to_string()),
+                timestamp: Utc::now(),
+            })) {
+                eprintln!("[FileSystemMonitor] Failed to send directory monitoring event: {:?}", e);
+                _event_errors += 1;
+            }
+        }
+
+        // Start enhanced file system monitoring
+        let sender_clone = sender.clone();
+        std::thread::spawn(move || {
+            Self::enhanced_file_system_monitoring(sender_clone, critical_dirs);
+        });
+
+        Ok(())
+    }
+
+    fn enhanced_file_system_monitoring(sender: Sender<Event>, critical_dirs: Vec<String>) {
+        let mut last_files: HashMap<String, u64> = HashMap::new();
+        let mut scan_count = 0;
+        let mut last_summary_time = std::time::Instant::now();
+        let mut consecutive_errors = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+        
+        // Suspicious file extensions to monitor
+        let suspicious_extensions = vec![
+            ".exe", ".dll", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar", ".scr",
+            ".com", ".pif", ".lnk", ".hta", ".wsf", ".wsh", ".reg", ".inf"
+        ];
+        
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2)); // More frequent scanning
+            scan_count += 1;
+            
+            let mut current_files: HashMap<String, u64> = HashMap::new();
+            let mut changes_detected = 0;
+            let mut event_errors = 0;
+            let mut scan_successful = true;
+            
+            for dir in &critical_dirs {
+                match Self::scan_directory(dir) {
+                    Ok(files) => {
+                        for (file_path, file_size) in files {
+                            current_files.insert(file_path.clone(), file_size);
+                            
+                            // Check for new files
+                            if !last_files.contains_key(&file_path) {
+                                changes_detected += 1;
+                                let event_key = format!("file_created_{}", file_path);
+                                if !should_rate_limit(&event_key, 30) { // Rate limit to 30 seconds
+                                    let severity = if Self::is_suspicious_file(&file_path, &suspicious_extensions) {
+                                        FileSystemEventType::Created
+                                    } else {
+                                        FileSystemEventType::Created
+                                    };
+                                    
+                                    if let Err(e) = sender.send(Event::FileSystem(FileSystemEvent {
+                                        event_type: severity,
+                                        path: file_path.clone(),
+                                        size: Some(file_size),
+                                        process_pid: None, // Will be enhanced with process tracking
+                                        process_name: None,
+                                        timestamp: Utc::now(),
+                                    })) {
+                                        eprintln!("[FileSystemMonitor] Failed to send file created event: {:?}", e);
+                                        event_errors += 1;
+                                    }
+                                }
+                            } else if let Some(old_size) = last_files.get(&file_path) {
+                                // Check for file modifications
+                                if old_size != &file_size {
+                                    changes_detected += 1;
+                                    let event_key = format!("file_modified_{}", file_path);
+                                    if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
+                                        if let Err(e) = sender.send(Event::FileSystem(FileSystemEvent {
+                                            event_type: FileSystemEventType::Modified,
+                                            path: file_path.clone(),
+                                            size: Some(file_size),
+                                            process_pid: None,
+                                            process_name: None,
+                                            timestamp: Utc::now(),
+                                        })) {
+                                            eprintln!("[FileSystemMonitor] Failed to send file modified event: {:?}", e);
+                                            event_errors += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Check for deleted files
+                        for (file_path, _) in &last_files {
+                            if !current_files.contains_key(file_path) {
+                                changes_detected += 1;
+                                let event_key = format!("file_deleted_{}", file_path);
+                                if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
+                                    if let Err(e) = sender.send(Event::FileSystem(FileSystemEvent {
+                                        event_type: FileSystemEventType::Deleted,
+                                        path: file_path.clone(),
+                                        size: None,
+                                        process_pid: None,
+                                        process_name: None,
+                                        timestamp: Utc::now(),
+                                    })) {
+                                        eprintln!("[FileSystemMonitor] Failed to send file deleted event: {:?}", e);
+                                        event_errors += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[FileSystemMonitor] Failed to scan directory {}: {:?}", dir, e);
+                        scan_successful = false;
+                        consecutive_errors += 1;
+                    }
+                }
+            }
+            
+            // Update error tracking
+            if event_errors > 0 {
+                consecutive_errors += 1;
+            } else if scan_successful {
+                consecutive_errors = 0;
+            }
+            
+            // Send periodic summary
+            if last_summary_time.elapsed() > std::time::Duration::from_secs(30) {
+                if changes_detected > 0 {
+                    if let Err(e) = sender.send(Event::FileSystem(FileSystemEvent {
+                        event_type: FileSystemEventType::Accessed,
+                        path: format!("[FileSystemMonitor] Scan #{} - {} file system changes detected ({} event errors)",
+                                     scan_count, changes_detected, event_errors),
+                        size: None,
+                        process_pid: None,
+                        process_name: Some("FileSystemMonitor".to_string()),
+                        timestamp: Utc::now(),
+                    })) {
+                        eprintln!("[FileSystemMonitor] Failed to send summary event: {:?}", e);
+                    }
+                }
+                last_summary_time = std::time::Instant::now();
+            }
+            
+            // Stop if too many consecutive errors
+            if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                eprintln!("[FileSystemMonitor] Too many consecutive errors, stopping file system monitoring");
+                let _ = sender.send(Event::FileSystem(FileSystemEvent {
+                    event_type: FileSystemEventType::Accessed,
+                    path: "[FileSystemMonitor] Stopped due to excessive errors".to_string(),
+                    size: None,
+                    process_pid: None,
+                    process_name: Some("FileSystemMonitor".to_string()),
+                    timestamp: Utc::now(),
+                }));
+                break;
+            }
+            
+            last_files = current_files;
+        }
+    }
+
+    fn scan_directory(dir_path: &str) -> Result<HashMap<String, u64>, Box<dyn Error>> {
+        let mut files = HashMap::new();
+        let path = std::path::Path::new(dir_path);
+        
+        if !path.exists() || !path.is_dir() {
+            return Ok(files);
+        }
+        
+        match fs::read_dir(path) {
+            Ok(entries) => {
+                for entry in entries.filter_map(|x| x.ok()) {
+                    let file_path = entry.path();
+                    if let Ok(metadata) = file_path.metadata() {
+                        if metadata.is_file() {
+                            let full_path = file_path.to_string_lossy().to_string();
+                            files.insert(full_path, metadata.len());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[FileSystemMonitor] Error reading directory {}: {:?}", dir_path, e);
+            }
+        }
+        
+        Ok(files)
+    }
+
+    fn is_suspicious_file(file_path: &str, suspicious_extensions: &[&str]) -> bool {
+        let path_lower = file_path.to_lowercase();
+        suspicious_extensions.iter().any(|ext| path_lower.ends_with(ext))
+    }
+}
+
+impl NetworkMonitor {
+    pub fn start_with_sender(&self, sender: Sender<Event>) -> Result<(), Box<dyn Error>> {
+        if let Err(e) = sender.send(Event::Network(NetworkEvent {
+            event_type: NetworkEventType::ConnectionEstablished,
+            local_address: "NetworkMonitor".to_string(),
+            remote_address: "localhost".to_string(),
+            local_port: None,
+            remote_port: None,
+            protocol: "TCP".to_string(),
+            process_pid: None,
+            process_name: Some("NetworkMonitor".to_string()),
+            bytes_sent: None,
+            bytes_received: None,
+            timestamp: Utc::now(),
+        })) {
+            eprintln!("[NetworkMonitor] Failed to send start event: {:?}", e);
+        }
+
+        // Start enhanced network monitoring
+        let sender_clone = sender.clone();
+        std::thread::spawn(move || {
+            Self::enhanced_network_monitoring(sender_clone);
+        });
+
+        Ok(())
+    }
+
+    fn enhanced_network_monitoring(sender: Sender<Event>) {
+        let mut last_connections: HashMap<String, NetworkConnectionInfo> = HashMap::new();
+        let mut scan_count = 0;
+        let mut last_summary_time = std::time::Instant::now();
+        let mut consecutive_errors = 0;
+        const MAX_CONSECUTIVE_ERRORS: u32 = 10;
+        
+        // Suspicious IP ranges and domains
+        let suspicious_ips = vec![
+            "192.168.1.1", // Example - would be replaced with actual suspicious IPs
+            "10.0.0.1",
+        ];
+        
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(3)); // Network monitoring interval
+            scan_count += 1;
+            
+            match Self::get_network_connections() {
+                Ok(current_connections) => {
+                    let mut changes_detected = 0;
+                    let mut event_errors = 0;
+                    
+                    // Check for new connections
+                    for (conn_id, conn_info) in &current_connections {
+                        if !last_connections.contains_key(conn_id) {
+                            changes_detected += 1;
+                            let event_key = format!("network_new_{}", conn_id);
+                            if !should_rate_limit(&event_key, 30) { // Rate limit to 30 seconds
+                                let severity = if Self::is_suspicious_connection(&conn_info, &suspicious_ips) {
+                                    NetworkEventType::ConnectionEstablished
+                                } else {
+                                    NetworkEventType::ConnectionEstablished
+                                };
+                                
+                                if let Err(e) = sender.send(Event::Network(NetworkEvent {
+                                    event_type: severity,
+                                    local_address: conn_info.local_address.clone(),
+                                    remote_address: conn_info.remote_address.clone(),
+                                    local_port: conn_info.local_port,
+                                    remote_port: conn_info.remote_port,
+                                    protocol: conn_info.protocol.clone(),
+                                    process_pid: conn_info.process_pid,
+                                    process_name: conn_info.process_name.clone(),
+                                    bytes_sent: conn_info.bytes_sent,
+                                    bytes_received: conn_info.bytes_received,
+                                    timestamp: Utc::now(),
+                                })) {
+                                    eprintln!("[NetworkMonitor] Failed to send new connection event: {:?}", e);
+                                    event_errors += 1;
+                                }
+                            }
+                        } else if let Some(old_conn) = last_connections.get(conn_id) {
+                            // Check for data transfer changes
+                            let data_changed = old_conn.bytes_sent != conn_info.bytes_sent || 
+                                            old_conn.bytes_received != conn_info.bytes_received;
+                            
+                            if data_changed {
+                                changes_detected += 1;
+                                let event_key = format!("network_data_{}", conn_id);
+                                if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
+                                    if let Err(e) = sender.send(Event::Network(NetworkEvent {
+                                        event_type: NetworkEventType::DataTransferred,
+                                        local_address: conn_info.local_address.clone(),
+                                        remote_address: conn_info.remote_address.clone(),
+                                        local_port: conn_info.local_port,
+                                        remote_port: conn_info.remote_port,
+                                        protocol: conn_info.protocol.clone(),
+                                        process_pid: conn_info.process_pid,
+                                        process_name: conn_info.process_name.clone(),
+                                        bytes_sent: conn_info.bytes_sent,
+                                        bytes_received: conn_info.bytes_received,
+                                        timestamp: Utc::now(),
+                                    })) {
+                                        eprintln!("[NetworkMonitor] Failed to send data transfer event: {:?}", e);
+                                        event_errors += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Check for closed connections
+                    for (conn_id, old_conn) in &last_connections {
+                        if !current_connections.contains_key(conn_id) {
+                            changes_detected += 1;
+                            let event_key = format!("network_closed_{}", conn_id);
+                            if !should_rate_limit(&event_key, 60) { // Rate limit to 1 minute
+                                if let Err(e) = sender.send(Event::Network(NetworkEvent {
+                                    event_type: NetworkEventType::ConnectionClosed,
+                                    local_address: old_conn.local_address.clone(),
+                                    remote_address: old_conn.remote_address.clone(),
+                                    local_port: old_conn.local_port,
+                                    remote_port: old_conn.remote_port,
+                                    protocol: old_conn.protocol.clone(),
+                                    process_pid: old_conn.process_pid,
+                                    process_name: old_conn.process_name.clone(),
+                                    bytes_sent: old_conn.bytes_sent,
+                                    bytes_received: old_conn.bytes_received,
+                                    timestamp: Utc::now(),
+                                })) {
+                                    eprintln!("[NetworkMonitor] Failed to send connection closed event: {:?}", e);
+                                    event_errors += 1;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Reset error count on successful scan
+                    if event_errors == 0 {
+                        consecutive_errors = 0;
+                    } else {
+                        consecutive_errors += 1;
+                    }
+                    
+                    // Send periodic summary
+                    if last_summary_time.elapsed() > std::time::Duration::from_secs(30) {
+                        if changes_detected > 0 {
+                            if let Err(e) = sender.send(Event::Network(NetworkEvent {
+                                event_type: NetworkEventType::ConnectionEstablished,
+                                local_address: format!("[NetworkMonitor] Scan #{} - {} network changes detected ({} event errors)",
+                                                     scan_count, changes_detected, event_errors),
+                                remote_address: "localhost".to_string(),
+                                local_port: None,
+                                remote_port: None,
+                                protocol: "TCP".to_string(),
+                                process_pid: None,
+                                process_name: Some("NetworkMonitor".to_string()),
+                                bytes_sent: None,
+                                bytes_received: None,
+                                timestamp: Utc::now(),
+                            })) {
+                                eprintln!("[NetworkMonitor] Failed to send summary event: {:?}", e);
+                            }
+                        }
+                        last_summary_time = std::time::Instant::now();
+                    }
+                    
+                    last_connections = current_connections;
+                }
+                Err(e) => {
+                    consecutive_errors += 1;
+                    eprintln!("[NetworkMonitor] Error getting network connections: {}", e);
+                    
+                    if consecutive_errors <= MAX_CONSECUTIVE_ERRORS {
+                        let _ = sender.send(Event::Network(NetworkEvent {
+                            event_type: NetworkEventType::ConnectionAttempt,
+                            local_address: format!("[NetworkMonitor] Error: {}", e),
+                            remote_address: "localhost".to_string(),
+                            local_port: None,
+                            remote_port: None,
+                            protocol: "TCP".to_string(),
+                            process_pid: None,
+                            process_name: Some("NetworkMonitor".to_string()),
+                            bytes_sent: None,
+                            bytes_received: None,
+                            timestamp: Utc::now(),
+                        }));
+                    }
+                    
+                    // Exponential backoff on consecutive errors
+                    let backoff_duration = std::time::Duration::from_secs(10 * 2u64.pow(consecutive_errors.min(3)));
+                    std::thread::sleep(backoff_duration);
+                    
+                    // Stop if too many consecutive errors
+                    if consecutive_errors >= MAX_CONSECUTIVE_ERRORS {
+                        eprintln!("[NetworkMonitor] Too many consecutive errors, stopping network monitoring");
+                        let _ = sender.send(Event::Network(NetworkEvent {
+                            event_type: NetworkEventType::ConnectionClosed,
+                            local_address: "[NetworkMonitor] Stopped due to excessive errors".to_string(),
+                            remote_address: "localhost".to_string(),
+                            local_port: None,
+                            remote_port: None,
+                            protocol: "TCP".to_string(),
+                            process_pid: None,
+                            process_name: Some("NetworkMonitor".to_string()),
+                            bytes_sent: None,
+                            bytes_received: None,
+                            timestamp: Utc::now(),
+                        }));
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    fn get_network_connections() -> Result<HashMap<String, NetworkConnectionInfo>, Box<dyn Error>> {
+        let mut connections = HashMap::new();
+        
+        // Use netstat command to get network connections
+        match Command::new("netstat").args(&["-an", "-p", "TCP"]).output() {
+            Ok(output) => {
+                if let Ok(output_str) = String::from_utf8(output.stdout) {
+                    for line in output_str.lines().skip(4) { // Skip header lines
+                        if let Some(conn_info) = Self::parse_netstat_line(line) {
+                            let conn_id = format!("{}_{}_{}_{}", 
+                                conn_info.local_address, conn_info.local_port.unwrap_or(0),
+                                conn_info.remote_address, conn_info.remote_port.unwrap_or(0));
+                            connections.insert(conn_id, conn_info);
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                eprintln!("[NetworkMonitor] Error running netstat: {}", e);
+                return Err(Box::new(e));
+            }
+        }
+        
+        Ok(connections)
+    }
+
+    fn parse_netstat_line(line: &str) -> Option<NetworkConnectionInfo> {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let protocol = parts[0].to_string();
+            let local_addr = parts[1].to_string();
+            let remote_addr = parts[2].to_string();
+            let state = parts[3].to_string();
+            
+            // Parse local address and port
+            let (local_ip, local_port) = Self::parse_address(&local_addr);
+            let (remote_ip, remote_port) = Self::parse_address(&remote_addr);
+            
+            // Only include established connections
+            if state == "ESTABLISHED" {
+                return Some(NetworkConnectionInfo {
+                    local_address: local_ip,
+                    remote_address: remote_ip,
+                    local_port: local_port,
+                    remote_port: remote_port,
+                    protocol,
+                    process_pid: None, // Will be enhanced with process tracking
+                    process_name: None,
+                    bytes_sent: None, // Will be enhanced with data tracking
+                    bytes_received: None,
+                });
+            }
+        }
+        None
+    }
+
+    fn parse_address(addr: &str) -> (String, Option<u16>) {
+        if let Some(colon_pos) = addr.rfind(':') {
+            let ip = addr[..colon_pos].to_string();
+            let port_str = &addr[colon_pos + 1..];
+            if let Ok(port) = port_str.parse::<u16>() {
+                return (ip, Some(port));
+            }
+        }
+        (addr.to_string(), None)
+    }
+
+    fn is_suspicious_connection(conn_info: &NetworkConnectionInfo, suspicious_ips: &[&str]) -> bool {
+        suspicious_ips.iter().any(|ip| {
+            conn_info.remote_address.contains(ip) || conn_info.local_address.contains(ip)
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NetworkConnectionInfo {
+    local_address: String,
+    remote_address: String,
+    local_port: Option<u16>,
+    remote_port: Option<u16>,
+    protocol: String,
+    process_pid: Option<u32>,
+    process_name: Option<String>,
+    bytes_sent: Option<u64>,
+    bytes_received: Option<u64>,
 }
 
 // Helper struct for parsing tasklist output

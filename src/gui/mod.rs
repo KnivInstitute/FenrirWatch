@@ -37,6 +37,8 @@ struct GraphData {
     service_events: Vec<f64>,
     registry_events: Vec<f64>,
     driver_events: Vec<f64>,
+    filesystem_events: Vec<f64>,
+    network_events: Vec<f64>,
     max_points: usize,
 }
 
@@ -101,6 +103,8 @@ impl FenrirWatchGUI {
                 service_events: Vec::new(),
                 registry_events: Vec::new(),
                 driver_events: Vec::new(),
+                filesystem_events: Vec::new(),
+                network_events: Vec::new(),
                 max_points: config.graph_max_points,
             })),
             export_format: match config.export_format.as_str() {
@@ -287,6 +291,58 @@ impl FenrirWatchGUI {
                     message: format!("⚠️  {}", hook_msg),
                     color: egui::Color32::from_rgb(255, 0, 0),
                     severity: EventSeverity::Critical,
+                }
+            },
+            Event::FileSystem(filesystem_event) => {
+                let (icon, color, severity) = match filesystem_event.event_type {
+                    crate::core::FileSystemEventType::Created => ("📄", egui::Color32::from_rgb(0, 255, 0), EventSeverity::Info),
+                    crate::core::FileSystemEventType::Modified => ("✏️", egui::Color32::from_rgb(255, 165, 0), EventSeverity::Warning),
+                    crate::core::FileSystemEventType::Deleted => ("🗑️", egui::Color32::from_rgb(255, 0, 0), EventSeverity::Warning),
+                    crate::core::FileSystemEventType::Renamed => ("🔄", egui::Color32::from_rgb(0, 191, 255), EventSeverity::Info),
+                    crate::core::FileSystemEventType::Accessed => ("👁️", egui::Color32::from_rgb(128, 128, 128), EventSeverity::Info),
+                };
+                
+                let size_info = if let Some(size) = filesystem_event.size {
+                    format!(" ({} bytes)", size)
+                } else {
+                    String::new()
+                };
+                
+                LogEvent {
+                    timestamp,
+                    event_type: "FileSystem".to_string(),
+                    message: format!("{} FILE {}: {}{}", icon, format!("{:?}", filesystem_event.event_type).to_uppercase(), filesystem_event.path, size_info),
+                    color,
+                    severity,
+                }
+            },
+            Event::Network(network_event) => {
+                let (icon, color, severity) = match network_event.event_type {
+                    crate::core::NetworkEventType::ConnectionEstablished => ("🔗", egui::Color32::from_rgb(0, 255, 0), EventSeverity::Info),
+                    crate::core::NetworkEventType::ConnectionClosed => ("🔌", egui::Color32::from_rgb(255, 0, 0), EventSeverity::Info),
+                    crate::core::NetworkEventType::DataTransferred => ("📡", egui::Color32::from_rgb(0, 191, 255), EventSeverity::Info),
+                    crate::core::NetworkEventType::ConnectionAttempt => ("🔍", egui::Color32::from_rgb(255, 255, 0), EventSeverity::Warning),
+                    crate::core::NetworkEventType::DNSQuery => ("🌐", egui::Color32::from_rgb(128, 0, 128), EventSeverity::Info),
+                };
+                
+                let port_info = if let (Some(local_port), Some(remote_port)) = (network_event.local_port, network_event.remote_port) {
+                    format!(":{} -> :{}", local_port, remote_port)
+                } else {
+                    String::new()
+                };
+                
+                let data_info = if let (Some(sent), Some(received)) = (network_event.bytes_sent, network_event.bytes_received) {
+                    format!(" ({} sent, {} received)", sent, received)
+                } else {
+                    String::new()
+                };
+                
+                LogEvent {
+                    timestamp,
+                    event_type: "Network".to_string(),
+                    message: format!("{} {} {} -> {}{}{}", icon, network_event.protocol, network_event.local_address, network_event.remote_address, port_info, data_info),
+                    color,
+                    severity,
                 }
             }
         }
@@ -493,7 +549,7 @@ impl FenrirWatchGUI {
         // Event type filter
         ui.horizontal(|ui| {
             ui.label("Event Types:");
-            let event_types = ["Process", "Service", "Registry", "Driver", "Autostart", "Hook"];
+            let event_types = ["Process", "Service", "Registry", "Driver", "Autostart", "Hook", "FileSystem", "Network"];
             for event_type in event_types.iter() {
                 let mut is_selected = self.selected_event_types.contains(&event_type.to_string());
                 if ui.checkbox(&mut is_selected, *event_type).clicked() {

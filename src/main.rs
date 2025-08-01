@@ -2,7 +2,7 @@ mod core;
 mod gui;
 mod config;
 
-use core::{ProcessMonitor, RegistryMonitor, ServiceMonitor, DriverMonitor, AutostartMonitor, HookDetector};
+use core::{ProcessMonitor, RegistryMonitor, ServiceMonitor, DriverMonitor, AutostartMonitor, HookDetector, FileSystemMonitor, NetworkMonitor};
 use core::Event;
 use core::EventLogger;
 use config::Config;
@@ -91,10 +91,33 @@ fn main() {
             }
         });
     }
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let monitor = FileSystemMonitor;
+            if let Err(e) = monitor.start_with_sender(sender) {
+                eprintln!("Error in FileSystemMonitor: {}", e);
+            }
+        });
+    }
+    {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            let monitor = NetworkMonitor;
+            if let Err(e) = monitor.start_with_sender(sender) {
+                eprintln!("Error in NetworkMonitor: {}", e);
+            }
+        });
+    }
     
     // Start logger
     EventLogger::start_logging(log_receiver, &config.log_path);
     
     // Launch the GUI (main thread)
     gui::launch_gui(gui_receiver);
+
+    // After GUI window closes, signal background threads to stop
+    core::request_shutdown();
+    // Give monitors time to flush and exit
+    std::thread::sleep(std::time::Duration::from_secs(1));
 }

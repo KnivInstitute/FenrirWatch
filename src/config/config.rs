@@ -54,6 +54,8 @@ impl Config {
                 "Driver".to_string(),
                 "Autostart".to_string(),
                 "Hook".to_string(),
+                "FileSystem".to_string(),
+                "Network".to_string(),
             ],
             event_filter: String::new(),
             graph_max_points: 100,
