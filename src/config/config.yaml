@@ -5,7 +5,7 @@ show_timestamps: true
 auto_scroll: true
 max_events: 1000
 selected_event_types:
-- Network
+- Process
 event_filter: ''
 graph_max_points: 100
 export_format: JSON

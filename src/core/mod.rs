@@ -158,6 +158,7 @@ pub struct NetworkConnectionInfo {
     pub bytes_sent: Option<u64>,
     pub bytes_received: Option<u64>,
     pub connection_state: String,
+    #[allow(dead_code)]
     pub creation_time: DateTime<Utc>,
 }
 
@@ -714,27 +715,36 @@ impl RegistryMonitor {
         }
 
         // Critical registry keys to monitor for security
+        // Separated into required and optional keys for better error handling
         let critical_keys = vec![
             (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
             (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
-            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"),
             (HKEY_CURRENT_USER.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Run"),
             (HKEY_CURRENT_USER.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"),
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"),
+        ];
+        
+        // Optional registry keys that may not exist on all systems
+        let optional_keys = vec![
+            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"),
             (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellExecuteHooks"),
             (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects"),
             (HKEY_LOCAL_MACHINE.0 as isize, r"SYSTEM\CurrentControlSet\Services"),
             (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"),
-            (HKEY_LOCAL_MACHINE.0 as isize, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"),
         ];
 
         // Initial scan of critical keys
         let mut event_errors = 0;
+        let mut keys_monitored = 0;
+        
+        // Process critical keys (report errors)
         for (hive, subkey) in &critical_keys {
             let key = RegKey::predef(*hive);
             match key.open_subkey_with_flags(subkey, KEY_READ) {
                 Ok(subkey_handle) => {
+                    keys_monitored += 1;
                     if let Err(e) = sender.send(Event::Registry(format!(
-                        "[RegistryMonitor] Monitoring: {}",
+                        "[RegistryMonitor] Monitoring critical key: {}",
                         subkey
                     ))) {
                         eprintln!("[RegistryMonitor] Failed to send monitoring event: {:?}", e);
@@ -751,13 +761,48 @@ impl RegistryMonitor {
                     }
                 }
                 Err(e) => {
-                    eprintln!("[RegistryMonitor] Failed to access registry key {}: {:?}", subkey, e);
+                    eprintln!("[RegistryMonitor] CRITICAL: Failed to access registry key {}: {:?}", subkey, e);
                     if let Err(send_err) = sender.send(Event::Registry(format!(
-                        "[RegistryMonitor] Error accessing: {} - {:?}",
+                        "[RegistryMonitor] CRITICAL ERROR accessing: {} - {:?}",
                         subkey, e
                     ))) {
                         eprintln!("[RegistryMonitor] Failed to send registry error event: {:?}", send_err);
+                    }
+                    event_errors += 1;
+                }
+            }
+        }
+        
+        // Process optional keys (silently skip missing ones)
+        for (hive, subkey) in &optional_keys {
+            let key = RegKey::predef(*hive);
+            match key.open_subkey_with_flags(subkey, KEY_READ) {
+                Ok(subkey_handle) => {
+                    keys_monitored += 1;
+                    if let Err(e) = sender.send(Event::Registry(format!(
+                        "[RegistryMonitor] Monitoring optional key: {}",
+                        subkey
+                    ))) {
+                        eprintln!("[RegistryMonitor] Failed to send monitoring event: {:?}", e);
                         event_errors += 1;
+                    }
+                    
+                    // Enumerate initial values
+                    for (name, value) in subkey_handle.enum_values().filter_map(|x| x.ok()) {
+                        let msg = format!("Initial: {} = {:?}", name, value);
+                        if let Err(e) = sender.send(Event::Registry(msg)) {
+                            eprintln!("[RegistryMonitor] Failed to send initial value event: {:?}", e);
+                            event_errors += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    // For optional keys, only log at debug level if key doesn't exist
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        // Silently skip - this is expected for optional keys
+                        continue;
+                    } else {
+                        eprintln!("[RegistryMonitor] Warning: Failed to access optional registry key {}: {:?}", subkey, e);
                     }
                 }
             }
@@ -765,8 +810,8 @@ impl RegistryMonitor {
 
         // Send summary of initial scan
         if let Err(e) = sender.send(Event::Registry(format!(
-            "[RegistryMonitor] Initial scan completed with {} event errors",
-            event_errors
+            "[RegistryMonitor] Initial scan completed: {} keys monitored, {} event errors",
+            keys_monitored, event_errors
         ))) {
             eprintln!("[RegistryMonitor] Failed to send initial scan summary: {:?}", e);
         }
@@ -774,13 +819,13 @@ impl RegistryMonitor {
         // Start enhanced periodic monitoring
         let sender_clone = sender.clone();
         std::thread::spawn(move || {
-            Self::enhanced_registry_monitoring(sender_clone, critical_keys);
+            Self::enhanced_registry_monitoring(sender_clone, critical_keys, optional_keys);
         });
 
         Ok(())
     }
 
-    fn enhanced_registry_monitoring(sender: Sender<Event>, critical_keys: Vec<(isize, &'static str)>) {
+    fn enhanced_registry_monitoring(sender: Sender<Event>, critical_keys: Vec<(isize, &'static str)>, optional_keys: Vec<(isize, &'static str)>) {
         let mut last_values: HashMap<String, String> = HashMap::new();
         let mut scan_count = 0;
         let mut last_summary_time = std::time::Instant::now();
@@ -796,7 +841,10 @@ impl RegistryMonitor {
             let mut event_errors = 0;
             let mut scan_successful = true;
             
-            for (hive, subkey) in &critical_keys {
+            // Process all keys (critical + optional) with different error handling
+            let all_keys: Vec<_> = critical_keys.iter().map(|k| (*k, true)).chain(optional_keys.iter().map(|k| (*k, false))).collect();
+            
+            for ((hive, subkey), is_critical) in &all_keys {
                 let key = RegKey::predef(*hive);
                 match key.open_subkey_with_flags(subkey, KEY_READ) {
                     Ok(subkey_handle) => {
@@ -858,9 +906,17 @@ impl RegistryMonitor {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[RegistryMonitor] Failed to access registry key {}: {:?}", subkey, e);
-                        scan_successful = false;
-                        consecutive_errors += 1;
+                        if *is_critical {
+                            eprintln!("[RegistryMonitor] CRITICAL: Failed to access registry key {}: {:?}", subkey, e);
+                            scan_successful = false;
+                            consecutive_errors += 1;
+                        } else {
+                            // For optional keys, only log non-NotFound errors
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                eprintln!("[RegistryMonitor] Warning: Failed to access optional registry key {}: {:?}", subkey, e);
+                            }
+                            // Don't count optional key NotFound errors against scan_successful
+                        }
                     }
                 }
             }
@@ -1072,6 +1128,7 @@ impl DriverMonitor {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn stop(&mut self) -> Result<(), Box<dyn Error>> {
         println!("[DriverMonitor] Driver monitoring stopped");
         Ok(())
@@ -1606,7 +1663,7 @@ impl NetworkMonitor {
         
         unsafe {
             let mut table_size = 0u32;
-            let mut tcp_table: *mut MIB_TCPTABLE_OWNER_PID = std::ptr::null_mut();
+            let tcp_table: *mut MIB_TCPTABLE_OWNER_PID;
             
             // Get table size
             let result = GetExtendedTcpTable(
@@ -1720,7 +1777,7 @@ impl NetworkMonitor {
         
         unsafe {
             let mut table_size = 0u32;
-            let mut udp_table: *mut MIB_UDPTABLE_OWNER_PID = std::ptr::null_mut();
+            let udp_table: *mut MIB_UDPTABLE_OWNER_PID;
             
             let result = GetExtendedUdpTable(
                 None,

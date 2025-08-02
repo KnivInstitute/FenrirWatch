@@ -41,9 +41,10 @@ FenrirWatch is a comprehensive Windows system monitoring application written in 
 ## Quick Start
 
 ### Prerequisites
+
 - Windows 10/11
-- Rust toolchain (latest stable)
-- Administrator privilege
+- Rust toolchain (latest stable) if building from IDE
+- Administrator privilege (to install from BIN installer)
 
 ### Configuration
 

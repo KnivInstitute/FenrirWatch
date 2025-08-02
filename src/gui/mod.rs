@@ -199,10 +199,6 @@ impl FenrirWatchGUI {
                 Err(_) => break,
             }
         }
-        
-        if event_count > 10 {
-            println!("[GUI] Processed {} events (limited to prevent lag)", event_count);
-        }
     }
 
     fn convert_event_to_log(&self, event: Event) -> LogEvent {
@@ -418,36 +414,89 @@ impl FenrirWatchGUI {
         let mut graph_data = self.graph_data.lock().unwrap();
         let now = Utc::now();
         
-        // Add timestamp if not exists
-        if graph_data.timestamps.is_empty() || graph_data.timestamps.last().unwrap() < &now {
-            graph_data.timestamps.push(now);
+        // Define time interval (5 seconds for better granularity)
+        let time_interval_seconds = 5;
+        
+        // Round down to nearest time interval
+        let current_interval = (now.timestamp() / time_interval_seconds) * time_interval_seconds;
+        let current_time = DateTime::from_timestamp(current_interval, 0).unwrap_or(now);
+        
+        // Check if we need to add a new time point
+        let needs_new_point = graph_data.timestamps.is_empty() || 
+            graph_data.timestamps.last().unwrap().timestamp() < current_interval;
+        
+        if needs_new_point {
+            // Add new time point
+            graph_data.timestamps.push(current_time);
+            
+            // Initialize all event type counters to 0 for this time point
+            graph_data.process_events.push(0.0);
+            graph_data.service_events.push(0.0);
+            graph_data.registry_events.push(0.0);
+            graph_data.driver_events.push(0.0);
+            graph_data.filesystem_events.push(0.0);
+            graph_data.network_events.push(0.0);
         }
         
-        // Update event counts
-        if event.event_type.contains("Process") {
-            graph_data.process_events.push(1.0);
-        } else if event.event_type.contains("Service") {
-            graph_data.service_events.push(1.0);
-        } else if event.event_type.contains("Registry") {
-            graph_data.registry_events.push(1.0);
-        } else if event.event_type.contains("Driver") {
-            graph_data.driver_events.push(1.0);
-        } else if event.event_type.contains("FileSystem") {
-            graph_data.filesystem_events.push(1.0);
-        } else if event.event_type.contains("Network") {
-            graph_data.network_events.push(1.0);
+        // Update the count for the current time interval (last index)
+        if let Some(last_index) = graph_data.timestamps.len().checked_sub(1) {
+            match event.event_type.as_str() {
+                "Process" => {
+                    if let Some(count) = graph_data.process_events.get_mut(last_index) {
+                        *count += 1.0;
+                    }
+                },
+                "Service" => {
+                    if let Some(count) = graph_data.service_events.get_mut(last_index) {
+                        *count += 1.0;
+                    }
+                },
+                "Registry" => {
+                    if let Some(count) = graph_data.registry_events.get_mut(last_index) {
+                        *count += 1.0;
+                    }
+                },
+                "Driver" => {
+                    if let Some(count) = graph_data.driver_events.get_mut(last_index) {
+                        *count += 1.0;
+                    }
+                },
+                "FileSystem" => {
+                    if let Some(count) = graph_data.filesystem_events.get_mut(last_index) {
+                        *count += 1.0;
+                    }
+                },
+                "Network" => {
+                    if let Some(count) = graph_data.network_events.get_mut(last_index) {
+                        *count += 1.0;
+                    }
+                },
+                _ => {} // Unknown event type
+            }
         }
         
-        // Keep only last max_points
+        // Keep only last max_points and ensure all vectors stay synchronized
         if graph_data.timestamps.len() > graph_data.max_points {
-            graph_data.timestamps.remove(0);
-            if !graph_data.process_events.is_empty() { graph_data.process_events.remove(0); }
-            if !graph_data.service_events.is_empty() { graph_data.service_events.remove(0); }
-            if !graph_data.registry_events.is_empty() { graph_data.registry_events.remove(0); }
-            if !graph_data.driver_events.is_empty() { graph_data.driver_events.remove(0); }
-            if !graph_data.filesystem_events.is_empty() { graph_data.filesystem_events.remove(0); }
-            if !graph_data.network_events.is_empty() { graph_data.network_events.remove(0); }
+            let excess = graph_data.timestamps.len() - graph_data.max_points;
+            
+            // Remove oldest data points from all vectors
+            graph_data.timestamps.drain(0..excess);
+            graph_data.process_events.drain(0..excess);
+            graph_data.service_events.drain(0..excess);
+            graph_data.registry_events.drain(0..excess);
+            graph_data.driver_events.drain(0..excess);
+            graph_data.filesystem_events.drain(0..excess);
+            graph_data.network_events.drain(0..excess);
         }
+        
+        // Ensure all vectors have the same length (safety check)
+        let target_len = graph_data.timestamps.len();
+        graph_data.process_events.resize(target_len, 0.0);
+        graph_data.service_events.resize(target_len, 0.0);
+        graph_data.registry_events.resize(target_len, 0.0);
+        graph_data.driver_events.resize(target_len, 0.0);
+        graph_data.filesystem_events.resize(target_len, 0.0);
+        graph_data.network_events.resize(target_len, 0.0);
     }
 
     fn export_events(&self) -> Result<String, Box<dyn std::error::Error>> {
@@ -749,57 +798,86 @@ impl FenrirWatchGUI {
             let plot = egui_plot::Plot::new("event_rate")
                 .height(200.0)
                 .allow_zoom(true)
-                .allow_drag(true);
+                .allow_drag(true)
+                .y_axis_label("Events per 5-second interval")
+                .x_axis_label("Time");
             
             plot.show(ui, |plot_ui| {
                 // Process events line
-                if !graph_data.process_events.is_empty() {
-                    let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
-                        .zip(graph_data.process_events.iter())
-                        .map(|(ts, &val)| [ts.timestamp() as f64, val])
-                        .collect();
-                    
+                let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
+                    .zip(graph_data.process_events.iter())
+                    .map(|(ts, &val)| [ts.timestamp() as f64, val])
+                    .collect();
+                
+                if !points.is_empty() {
                     plot_ui.line(egui_plot::Line::new(points)
                         .name("Process Events")
                         .color(egui::Color32::GREEN));
                 }
                 
                 // Service events line
-                if !graph_data.service_events.is_empty() {
-                    let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
-                        .zip(graph_data.service_events.iter())
-                        .map(|(ts, &val)| [ts.timestamp() as f64, val])
-                        .collect();
-                    
+                let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
+                    .zip(graph_data.service_events.iter())
+                    .map(|(ts, &val)| [ts.timestamp() as f64, val])
+                    .collect();
+                
+                if !points.is_empty() {
                     plot_ui.line(egui_plot::Line::new(points)
                         .name("Service Events")
                         .color(egui::Color32::from_rgb(255, 165, 0)));
                 }
                 
                 // Registry events line
-                if !graph_data.registry_events.is_empty() {
-                    let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
-                        .zip(graph_data.registry_events.iter())
-                        .map(|(ts, &val)| [ts.timestamp() as f64, val])
-                        .collect();
-                    
+                let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
+                    .zip(graph_data.registry_events.iter())
+                    .map(|(ts, &val)| [ts.timestamp() as f64, val])
+                    .collect();
+                
+                if !points.is_empty() {
                     plot_ui.line(egui_plot::Line::new(points)
                         .name("Registry Events")
                         .color(egui::Color32::YELLOW));
                 }
                 
                 // Driver events line
-                if !graph_data.driver_events.is_empty() {
-                    let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
-                        .zip(graph_data.driver_events.iter())
-                        .map(|(ts, &val)| [ts.timestamp() as f64, val])
-                        .collect();
-                    
+                let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
+                    .zip(graph_data.driver_events.iter())
+                    .map(|(ts, &val)| [ts.timestamp() as f64, val])
+                    .collect();
+                
+                if !points.is_empty() {
                     plot_ui.line(egui_plot::Line::new(points)
                         .name("Driver Events")
                         .color(egui::Color32::BLUE));
                 }
+                
+                // FileSystem events line
+                let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
+                    .zip(graph_data.filesystem_events.iter())
+                    .map(|(ts, &val)| [ts.timestamp() as f64, val])
+                    .collect();
+                
+                if !points.is_empty() {
+                    plot_ui.line(egui_plot::Line::new(points)
+                        .name("FileSystem Events")
+                        .color(egui::Color32::from_rgb(128, 0, 128)));
+                }
+                
+                // Network events line
+                let points: Vec<[f64; 2]> = graph_data.timestamps.iter()
+                    .zip(graph_data.network_events.iter())
+                    .map(|(ts, &val)| [ts.timestamp() as f64, val])
+                    .collect();
+                
+                if !points.is_empty() {
+                    plot_ui.line(egui_plot::Line::new(points)
+                        .name("Network Events")
+                        .color(egui::Color32::from_rgb(0, 128, 255)));
+                }
             });
+        } else {
+            ui.label("⏳ Waiting for events to display graph data...");
+            ui.label("💡 The graph will show event rates aggregated over 5-second intervals");
         }
 
         // Statistics cards
@@ -1213,7 +1291,7 @@ impl FenrirWatchGUI {
             
             if ui.button("🔄 Reset to Defaults").clicked() {
                 // Reset to defaults
-                self.dark_mode = false;
+                self.dark_mode = true;
                 self.show_timestamps = true;
                 self.auto_scroll = true;
                 self.max_events = 1000;

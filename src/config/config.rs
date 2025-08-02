@@ -43,7 +43,7 @@ impl Config {
         Config {
             log_path: "fenrirwatch.log".to_string(),
             log_format: "json".to_string(),
-            dark_mode: false,
+            dark_mode: true,
             show_timestamps: true,
             auto_scroll: true,
             max_events: 1000,
