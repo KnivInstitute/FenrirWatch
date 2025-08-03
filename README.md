@@ -55,23 +55,23 @@ If you do not launch the app as admin, it will encounter the inability to access
 
 Below is an example of something you may see if you do not launch as an administrator.
 
-![example of restricted](images\oserror_example.png)
+![example of restricted](images/oserror_example.png)
 
 Once you launch as administrator, you'll see the primary GUI.
 
-![primary GUI](images\console_app.png)
+![primary GUI](images/console_app.png)
 
 This is where all the fun happens. You can see all the logs being written in the main GUI tab and also select specific information you do (not?) want. You can also save your specific configuration via the save button and it will save what you want for next startup.
 
 There's also a real-time event graph:
 
-![event graph](images\graph.png)
+![event graph](images/graph.png)
 
 Which you can also interact with as you please (zoom, adjust timeline, etc).
 
 There's also an enhanced statistics page which shows what's generally happening.
 
-![stat viewer](images\summary_events.png)
+![stat viewer](images/summary_events.png)
 
 ### Configuration
 
@@ -94,10 +94,10 @@ The application uses `src/config/config.yaml` for configuration. Key settings in
 ### **Registry Monitoring**
 
 - Critical security keys monitoring:
-  - `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`
-  - `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce`
-  - `HKCU\SOFTWARE\Microsoft\Windows\CurrentVersion\Run`
-  - `HKLM\SYSTEM\CurrentControlSet\Services`
+  - `HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/Run`
+  - `HKLM/SOFTWARE/Microsoft/Windows/CurrentVersion/RunOnce`
+  - `HKCU/SOFTWARE/Microsoft/Windows/CurrentVersion/Run`
+  - `HKLM/SYSTEM/CurrentControlSet/Services`
 - Real-time change detection
 - Rate limiting for change events
 
